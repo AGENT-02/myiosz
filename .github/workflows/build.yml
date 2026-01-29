@@ -36,4 +36,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Enigma_Jailed_Final
-          path: .theos/obj/*.dylib       <-- THIS IS CORRECT
+          path: .theos/obj/*.dylib
