@@ -1,4 +1,4 @@
-name: Build Enigma iOS 26
+name: Build Enigma Final
 
 on:
   push:
@@ -12,13 +12,16 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Install Dependencies
+        run: |
+          # FIX: Install ldid so Theos can sign the output
+          brew install ldid
+          
       - name: Setup Theos
         run: |
-          # FIX: Force remove existing directories to prevent "already exists" error
           rm -rf ~/theos
           git clone --recursive https://github.com/theos/theos.git ~/theos
           
-          # FIX: Force remove SDKs directory before cloning
           rm -rf ~/theos/sdks
           git clone https://github.com/theos/sdks.git ~/theos/sdks
           
@@ -26,12 +29,11 @@ jobs:
 
       - name: Build Dylib
         run: |
-          # We ignore SDK missing warnings if the repo doesn't strictly have a folder named '26.0' yet
-          # It will fall back to the latest available SDK but target 26.0 deployment
+          # Use the latest SDK but keep our settings
           make package FINALPACKAGE=1
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Enigma_iOS26_Jailed
+          name: Enigma_Jailed_Final
           path: .theos/obj/debug/*.dylib
