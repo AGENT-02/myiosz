@@ -6,7 +6,6 @@
 #define THEME_COLOR [UIColor colorWithRed:0.0 green:1.0 blue:0.8 alpha:1.0]
 
 // --- GLOBAL LOGGER STATE ---
-// We use a static pointer so the Hook can talk to the UI
 static UITextView *globalConsole = nil;
 static BOOL isLoggerActive = NO;
 
@@ -50,11 +49,10 @@ void loggerWrite(NSString *fmt, ...) {
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     if ([hit isDescendantOfView:self.blurPanel]) return hit;
-    return nil; // Pass clicks to Snapchat
+    return nil;
 }
 
 - (void)setupUI {
-    // 1. Floating Button (The "Ω")
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = CGRectMake(self.frame.size.width - 60, 100, 50, 50);
     btn.backgroundColor = [UIColor blackColor];
@@ -66,7 +64,6 @@ void loggerWrite(NSString *fmt, ...) {
     [btn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:btn];
 
-    // 2. The Main Panel (Hidden by default)
     self.blurPanel = [[UIView alloc] initWithFrame:CGRectMake(20, 160, self.frame.size.width - 40, 400)];
     self.blurPanel.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
     self.blurPanel.layer.cornerRadius = 15;
@@ -75,7 +72,6 @@ void loggerWrite(NSString *fmt, ...) {
     self.blurPanel.hidden = YES;
     [self addSubview:self.blurPanel];
 
-    // 3. Logger Header & Toggle (Matches your image)
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 15, 200, 20)];
     title.text = @"CLASS LOGGER";
     title.textColor = THEME_COLOR;
@@ -87,7 +83,6 @@ void loggerWrite(NSString *fmt, ...) {
     [self.loggerToggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
     [self.blurPanel addSubview:self.loggerToggle];
 
-    // 4. The Console (Green Text)
     self.consoleView = [[UITextView alloc] initWithFrame:CGRectMake(15, 60, self.blurPanel.frame.size.width - 30, 260)];
     self.consoleView.backgroundColor = [UIColor blackColor];
     self.consoleView.textColor = [UIColor greenColor];
@@ -99,10 +94,8 @@ void loggerWrite(NSString *fmt, ...) {
     self.consoleView.layer.borderColor = [UIColor grayColor].CGColor;
     [self.blurPanel addSubview:self.consoleView];
     
-    // Link global pointer so hooks can write to it
     globalConsole = self.consoleView;
 
-    // 5. Action Buttons
     UIButton *copyBtn = [self makeBtn:@"[ COPY LOG ]" x:15 y:340];
     [copyBtn addTarget:self action:@selector(doCopy) forControlEvents:UIControlEventTouchUpInside];
     
@@ -132,12 +125,10 @@ void loggerWrite(NSString *fmt, ...) {
 
 @end
 
-// --- THE REAL HOOKS (This is what fixes "logs nothing") ---
+// --- THE HOOKS ---
 
-// We explicitly hook the class from your screenshot
 %hook SCONeTapLoginMultiAccountLandingPage
 
-// 1. Hook View Lifecycle (Logs when the screen appears)
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     loggerWrite(@"[EVENT] viewDidAppear: called");
@@ -146,24 +137,21 @@ void loggerWrite(NSString *fmt, ...) {
 
 - (void)viewDidLoad {
     %orig;
-    loggerWrite(@"[EVENT] viewDidLoad: called (Screen Loaded)");
+    loggerWrite(@"[EVENT] viewDidLoad: called");
 }
 
-// 2. Hook Touch Events (Logs when you tap the screen)
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
     %orig;
+    // FIX: Cast self to UIViewController so the compiler sees the .view property
+    UIViewController *controller = (UIViewController *)self;
+    
     UITouch *t = [touches anyObject];
-    CGPoint p = [t locationInView:self.view];
+    CGPoint p = [t locationInView:controller.view];
     loggerWrite(@"[TOUCH] Tapped at {%.0f, %.0f}", p.x, p.y);
 }
 
-// 3. Hook generic interaction (Guessing common Snapchat method names)
-// If these exist, they will log. If not, %hook usually ignores them safely in standard configs,
-// but to be safe we stick to standard UIViewController methods above.
-
 %end
 
-// --- ENTRY POINT ---
 %ctor {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = [UIApplication sharedApplication].keyWindow;
