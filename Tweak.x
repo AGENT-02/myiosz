@@ -1,6 +1,16 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 
+// --- FIX: Declare C Functions at the VERY TOP ---
+// This prevents the "expected identifier" error
+#ifdef __cplusplus
+extern "C" {
+#endif
+    CFPropertyListRef MGCopyAnswer(CFStringRef property);
+#ifdef __cplusplus
+}
+#endif
+
 // --- Variables ---
 static NSString *fakeUUID = @"E621E1F8-C36C-495A-93FC-0C247A3E6E5F";
 static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
@@ -24,7 +34,6 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
     return self;
 }
 
-// Allow touches to pass through the empty space
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
     if (hitView == self) return nil;
@@ -32,7 +41,6 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 }
 
 - (void)setupUI {
-    // 1. Corner Button
     self.cornerBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.cornerBtn.frame = CGRectMake(self.frame.size.width - 65, 60, 50, 50);
     self.cornerBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
@@ -43,7 +51,6 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
     [self.cornerBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.cornerBtn];
 
-    // 2. Menu
     self.menuView = [[UIView alloc] initWithFrame:CGRectMake(25, 120, self.frame.size.width - 50, 340)];
     self.menuView.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
     self.menuView.layer.cornerRadius = 18;
@@ -52,7 +59,6 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
     self.menuView.hidden = YES;
     [self addSubview:self.menuView];
 
-    // Title
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(0, 15, self.menuView.frame.size.width, 25)];
     t.text = @"ENIGMA iOS 26.2";
     t.textAlignment = NSTextAlignmentCenter;
@@ -60,7 +66,6 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
     t.font = [UIFont boldSystemFontOfSize:16];
     [self.menuView addSubview:t];
 
-    // Info
     self.infoLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, self.menuView.frame.size.width - 40, 50)];
     self.infoLabel.numberOfLines = 2;
     self.infoLabel.textColor = [UIColor whiteColor];
@@ -68,7 +73,6 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
     [self updateLabels];
     [self.menuView addSubview:self.infoLabel];
 
-    // Buttons
     [self makeBtn:@"Rotate UUID" y:110 col:[UIColor systemBlueColor] sel:@selector(doUUID)];
     [self makeBtn:@"Rotate UDID" y:165 col:[UIColor systemIndigoColor] sel:@selector(doUDID)];
     [self makeBtn:@"Close Menu" y:240 col:[UIColor systemRedColor] sel:@selector(toggleMenu)];
@@ -91,8 +95,8 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 
 - (void)updateLabels {
     self.infoLabel.text = [NSString stringWithFormat:@"UUID: ...%@\nUDID: ...%@", 
-        [fakeUUID substringFromIndex:fakeUUID.length-12], 
-        [fakeUDID substringFromIndex:fakeUDID.length-12]];
+        [fakeUUID substringFromIndex:MAX(0, (int)fakeUUID.length-12)], 
+        [fakeUDID substringFromIndex:MAX(0, (int)fakeUDID.length-12)]];
 }
 
 - (void)doUUID {
@@ -118,8 +122,10 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 }
 %end
 
-extern "C" CFPropertyListRef MGCopyAnswer(CFStringRef property);
+// Function pointer for the original MGCopyAnswer
 static CFPropertyListRef (*old_MGCopyAnswer)(CFStringRef property);
+
+// Our replacement function
 CFPropertyListRef new_MGCopyAnswer(CFStringRef property) {
     if (property && CFStringCompare(property, CFSTR("UniqueDeviceID"), 0) == kCFCompareEqualTo) {
         return (__bridge CFPropertyListRef)fakeUDID;
@@ -131,16 +137,22 @@ CFPropertyListRef new_MGCopyAnswer(CFStringRef property) {
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             UIWindow *w = nil;
-            // iOS 26 Scene Logic
-            for (UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) {
-                if (s.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *win in s.windows) if (win.isKeyWindow) { w = win; break; }
+            if (@available(iOS 13.0, *)) {
+                for (UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) {
+                    if (s.activationState == UISceneActivationStateForegroundActive) {
+                        for (UIWindow *win in s.windows) if (win.isKeyWindow) { w = win; break; }
+                    }
                 }
             }
+            // Fallback for older method (deprecation warning is now suppressed via Makefile)
             if (!w) w = [UIApplication sharedApplication].keyWindow;
+            
             if (w) [w addSubview:[[EnigmaOverlay alloc] initWithFrame:w.bounds]];
         });
     }];
+    
+    // Hooking the C function
     MSHookFunction((void *)MGCopyAnswer, (void *)new_MGCopyAnswer, (void **)&old_MGCopyAnswer);
+    
     %init;
 }
