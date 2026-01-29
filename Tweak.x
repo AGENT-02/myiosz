@@ -1,125 +1,120 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 
-// --- Global Variables to store fake IDs ---
-static NSString *fakeUUID = @"E621E1F8-C36C-495A-93FC-0C247A3E6E5F";
-static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
+// Static storage for the spoofed identifiers
+static NSString *fakeUUID = @"770E8400-E29B-41D4-A716-446655440000";
+static NSString *fakeUDID = @"9999999999999999999999999999999999999999";
 
-// --- The Menu Interface ---
-@interface EnigmaMenu : UIView
-@property (nonatomic, strong) UIView *containerView;
-@property (nonatomic, strong) UILabel *uuidLabel;
-@property (nonatomic, strong) UILabel *udidLabel;
+@interface EnigmaOverlay : UIView
+@property (nonatomic, strong) UIButton *cornerBtn;
+@property (nonatomic, strong) UIView *menuView;
+@property (nonatomic, strong) UILabel *infoLabel;
 @end
 
-@implementation EnigmaMenu
+@implementation EnigmaOverlay
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
         self.userInteractionEnabled = YES;
+        // This ensures the overlay doesn't block touches to the app unless interacting with our UI
+        self.backgroundColor = [UIColor clearColor];
         [self setupUI];
     }
     return self;
 }
 
+// Ensure touches pass through the clear areas of the overlay to the app underneath
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hitView = [super hitTest:point withEvent:event];
+    if (hitView == self) return nil;
+    return hitView;
+}
+
 - (void)setupUI {
-    // 1. The Floating Corner Button (Persists at Top Right)
-    UIButton *cornerBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    cornerBtn.frame = CGRectMake(self.frame.size.width - 65, 60, 50, 50);
-    cornerBtn.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.8];
-    cornerBtn.layer.cornerRadius = 25;
-    [cornerBtn setTitle:@"Ω" forState:UIControlStateNormal];
-    cornerBtn.titleLabel.font = [UIFont systemFontOfSize:24 weight:UIFontWeightBold];
-    [cornerBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:cornerBtn];
+    // 1. Persistent Corner Button (Ω)
+    self.cornerBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.cornerBtn.frame = CGRectMake(self.frame.size.width - 60, 50, 50, 50);
+    self.cornerBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+    self.cornerBtn.layer.cornerRadius = 25;
+    self.cornerBtn.layer.borderWidth = 1;
+    self.cornerBtn.layer.borderColor = [UIColor systemBlueColor].CGColor;
+    [self.cornerBtn setTitle:@"Ω" forState:UIControlStateNormal];
+    [self.cornerBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.cornerBtn];
 
-    // 2. The Main Menu Container
-    self.containerView = [[UIView alloc] initWithFrame:CGRectMake(20, 120, self.frame.size.width - 40, 350)];
-    self.containerView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
-    self.containerView.layer.cornerRadius = 20;
-    self.containerView.layer.borderWidth = 1;
-    self.containerView.layer.borderColor = [UIColor grayColor].CGColor;
-    self.containerView.hidden = YES; // Start hidden
-    [self addSubview:self.containerView];
+    // 2. The Jailed Menu
+    self.menuView = [[UIView alloc] initWithFrame:CGRectMake(30, 110, self.frame.size.width - 60, 320)];
+    self.menuView.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.1 alpha:0.95];
+    self.menuView.layer.cornerRadius = 20;
+    self.menuView.hidden = YES;
+    [self addSubview:self.menuView];
 
-    // 3. Labels and Buttons for UUID/UDID
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 10, self.containerView.frame.size.width, 30)];
-    titleLabel.text = @"ENIGMA v26.2 JAILED";
-    titleLabel.textAlignment = NSTextAlignmentCenter;
-    titleLabel.textColor = [UIColor whiteColor];
-    [self.containerView addSubview:titleLabel];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 15, self.menuView.frame.size.width, 30)];
+    title.text = @"ENIGMA JAILED 26.2";
+    title.textAlignment = NSTextAlignmentCenter;
+    title.textColor = [UIColor systemBlueColor];
+    title.font = [UIFont boldSystemFontOfSize:18];
+    [self.menuView addSubview:title];
 
-    // UUID Section
-    self.uuidLabel = [[UILabel alloc] initWithFrame:CGRectMake(15, 60, 250, 20)];
-    self.uuidLabel.text = [NSString stringWithFormat:@"UUID: %@", [fakeUUID substringToIndex:15]];
-    self.uuidLabel.textColor = [UIColor lightGrayColor];
-    self.uuidLabel.font = [UIFont systemFontOfSize:10];
-    [self.containerView addSubview:self.uuidLabel];
+    // Status Label
+    self.infoLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, self.menuView.frame.size.width - 40, 60)];
+    self.infoLabel.numberOfLines = 0;
+    self.infoLabel.textColor = [UIColor whiteColor];
+    self.infoLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    [self updateLabels];
+    [self.menuView addSubview:self.infoLabel];
 
-    UIButton *uuidBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    uuidBtn.frame = CGRectMake(15, 85, self.containerView.frame.size.width - 30, 40);
-    uuidBtn.backgroundColor = [UIColor systemBlueColor];
-    uuidBtn.layer.cornerRadius = 10;
-    [uuidBtn setTitle:@"Change UUID" forState:UIControlStateNormal];
-    [uuidBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [uuidBtn addTarget:self action:@selector(changeUUID) forControlEvents:UIControlEventTouchUpInside];
-    [self.containerView addSubview:uuidBtn];
+    // Action Buttons
+    UIButton *btnUUID = [self createBtn:CGRectMake(20, 120, self.menuView.frame.size.width - 40, 45) title:@"Rotate UUID" color:[UIColor systemBlueColor]];
+    [btnUUID addTarget:self action:@selector(doUUID) forControlEvents:UIControlEventTouchUpInside];
+    [self.menuView addSubview:btnUUID];
 
-    // UDID Section
-    self.udidLabel = [[UILabel alloc] initWithFrame:CGRectMake(15, 145, 250, 20)];
-    self.udidLabel.text = [NSString stringWithFormat:@"UDID: %@", [fakeUDID substringToIndex:15]];
-    self.udidLabel.textColor = [UIColor lightGrayColor];
-    self.udidLabel.font = [UIFont systemFontOfSize:10];
-    [self.containerView addSubview:self.udidLabel];
+    UIButton *btnUDID = [self createBtn:CGRectMake(20, 175, self.menuView.frame.size.width - 40, 45) title:@"Rotate UDID" color:[UIColor systemIndigoColor]];
+    [btnUDID addTarget:self action:@selector(doUDID) forControlEvents:UIControlEventTouchUpInside];
+    [self.menuView addSubview:btnUDID];
 
-    UIButton *udidBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    udidBtn.frame = CGRectMake(15, 170, self.containerView.frame.size.width - 30, 40);
-    udidBtn.backgroundColor = [UIColor systemIndigoColor];
-    udidBtn.layer.cornerRadius = 10;
-    [udidBtn setTitle:@"Change UDID" forState:UIControlStateNormal];
-    [udidBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [udidBtn addTarget:self action:@selector(changeUDID) forControlEvents:UIControlEventTouchUpInside];
-    [self.containerView addSubview:udidBtn];
+    UIButton *btnClose = [self createBtn:CGRectMake(20, 250, self.menuView.frame.size.width - 40, 45) title:@"Close Menu" color:[UIColor systemRedColor]];
+    [btnClose addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+    [self.menuView addSubview:btnClose];
+}
 
-    // 4. Close Menu Button
-    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeBtn.frame = CGRectMake(15, 280, self.containerView.frame.size.width - 30, 40);
-    closeBtn.backgroundColor = [UIColor systemRedColor];
-    closeBtn.layer.cornerRadius = 10;
-    [closeBtn setTitle:@"Close Menu" forState:UIControlStateNormal];
-    [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [closeBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [self.containerView addSubview:closeBtn];
+- (UIButton *)createBtn:(CGRect)frame title:(NSString *)title color:(UIColor *)color {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = frame;
+    btn.backgroundColor = color;
+    btn.layer.cornerRadius = 10;
+    [btn setTitle:title forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    return btn;
+}
+
+- (void)updateLabels {
+    self.infoLabel.text = [NSString stringWithFormat:@"CURRENT IDENTITY:\nUUID: %@\nUDID: %@", 
+                           [fakeUUID substringToIndex:12], [fakeUDID substringToIndex:12]];
 }
 
 - (void)toggleMenu {
-    self.containerView.hidden = !self.containerView.hidden;
+    self.menuView.hidden = !self.menuView.hidden;
 }
 
-- (void)changeUUID {
+- (void)doUUID {
     fakeUUID = [[NSUUID UUID] UUIDString];
-    self.uuidLabel.text = [NSString stringWithFormat:@"UUID: %@", [fakeUUID substringToIndex:15]];
-    // Haptic Feedback
-    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [haptic impactOccurred];
+    [self updateLabels];
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
 }
 
-- (void)changeUDID {
-    NSString *letters = @"abcdef0123456789";
-    NSMutableString *randomString = [NSMutableString stringWithCapacity:40];
-    for (int i=0; i<40; i++) {
-        [randomString appendFormat: @"%C", [letters characterAtIndex: arc4random_uniform((uint32_t)[letters length])]];
-    }
-    fakeUDID = randomString;
-    self.udidLabel.text = [NSString stringWithFormat:@"UDID: %@", [fakeUDID substringToIndex:15]];
-    
-    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
-    [haptic impactOccurred];
+- (void)doUDID {
+    NSString *pool = @"abcdef0123456789";
+    NSMutableString *res = [NSMutableString stringWithCapacity:40];
+    for (int i=0; i<40; i++) [res appendFormat:@"%C", [pool characterAtIndex:arc4random_uniform(16)]];
+    fakeUDID = res;
+    [self updateLabels];
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy] impactOccurred];
 }
 @end
 
-// --- HOOKS ---
+// --- THE HOOKS ---
 
 %hook UIDevice
 - (NSUUID *)identifierForVendor {
@@ -127,8 +122,7 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 }
 %end
 
-// Note: MGCopyAnswer is a C-function. 
-// In a jailed environment, this hook is less reliable but included for completeness.
+// Jailed UDID Hooking
 extern "C" CFPropertyListRef MGCopyAnswer(CFStringRef property);
 static CFPropertyListRef (*old_MGCopyAnswer)(CFStringRef property);
 
@@ -139,35 +133,27 @@ CFPropertyListRef new_MGCopyAnswer(CFStringRef property) {
     return old_MGCopyAnswer(property);
 }
 
-// --- Initialization ---
-%ctor {
-    // Wait for the app to finish loading so we can find the KeyWindow
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UIWindow *keyWindow = nil;
-            if (@available(iOS 13.0, *)) {
-                for (UIWindowScene* windowScene in [UIApplication sharedApplication].connectedScenes) {
-                    if (windowScene.activationState == UISceneActivationStateForegroundActive) {
-                        for (UIWindow *window in windowScene.windows) {
-                            if (window.isKeyWindow) {
-                                keyWindow = window;
-                                break;
-                            }
-                        }
-                    }
-                }
-            } else {
-                keyWindow = [UIApplication sharedApplication].keyWindow;
-            }
+// --- INITIALIZATION ---
 
-            if (keyWindow) {
-                EnigmaMenu *menu = [[EnigmaMenu alloc] initWithFrame:keyWindow.bounds];
-                [keyWindow addSubview:menu];
+%ctor {
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIWindow *keyWin = nil;
+            // Modern iOS 26.2 Window Retrieval
+            for (UIWindowScene* scene in [UIApplication sharedApplication].connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *w in scene.windows) if (w.isKeyWindow) { keyWin = w; break; }
+                }
+            }
+            if (!keyWin) keyWin = [UIApplication sharedApplication].keyWindow;
+            
+            if (keyWin) {
+                EnigmaOverlay *overlay = [[EnigmaOverlay alloc] initWithFrame:keyWin.bounds];
+                [keyWin addSubview:overlay];
             }
         });
     }];
-
-    // Initialize C-function hooks
+    
     MSHookFunction((void *)MGCopyAnswer, (void *)new_MGCopyAnswer, (void **)&old_MGCopyAnswer);
     %init;
 }
