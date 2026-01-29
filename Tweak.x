@@ -46,6 +46,31 @@ void savePrefs() {
     [d synchronize];
 }
 
+// --- BINARY ANALYSIS ENGINE ---
+NSString* analyzeBinaryEncryption(NSString *dylibName) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        NSString *name = [NSString stringWithUTF8String:_dyld_get_image_name(i)];
+        if ([name.lastPathComponent isEqualToString:dylibName]) {
+            const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            uintptr_t cmdPtr = (uintptr_t)(header + 1);
+            
+            for (uint32_t j = 0; j < header->ncmds; j++) {
+                struct load_command *lc = (struct load_command *)cmdPtr;
+                if (lc->cmd == LC_ENCRYPTION_INFO_64) {
+                    struct encryption_info_command_64 *eic = (struct encryption_info_command_64 *)lc;
+                    return [NSString stringWithFormat:
+                        @"Module: %@\nLoad Addr: %p\nCryptID: %u (%@)", 
+                        dylibName, header, eic->cryptid, 
+                        (eic->cryptid == 0 ? @"DECRYPTED" : @"ENCRYPTED")];
+                }
+                cmdPtr += lc->cmdsize;
+            }
+        }
+    }
+    return @"No Encryption Info (System Lib)";
+}
+
 // --- NETWORK LOGGER ---
 @interface EnigmaNetLogger : NSURLProtocol @end
 @implementation EnigmaNetLogger
@@ -87,20 +112,16 @@ void savePrefs() {
 @property (nonatomic, strong) UIView *terminalView;
 @property (nonatomic, strong) UIView *editorView;
 
-// Identity Elements
+// Elements
 @property (nonatomic, strong) UILabel *idInfoLabel;
 @property (nonatomic, strong) UITextField *latField;
 @property (nonatomic, strong) UITextField *lngField;
-
-// Inspector & Lib Elements
 @property (nonatomic, strong) UITextField *searchField;
 @property (nonatomic, strong) UITableView *classTable;
 @property (nonatomic, strong) NSMutableArray *allClasses;
 @property (nonatomic, strong) NSMutableArray *filteredClasses;
 @property (nonatomic, strong) NSMutableArray *loadedLibraries;
 @property (nonatomic, strong) UITableView *libraryTable;
-
-// Terminal
 @property (nonatomic, strong) UITextView *consoleView;
 @property (nonatomic, strong) UIButton *netToggleBtn;
 
@@ -123,7 +144,6 @@ void savePrefs() {
         [self loadData];
         [self setupUI];
         
-        // Tap Gesture for Editor
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleGlobalTap:)];
         tap.delegate = self;
         [self addGestureRecognizer:tap];
@@ -133,48 +153,27 @@ void savePrefs() {
     return self;
 }
 
-// 1. CRITICAL: FORCE TOUCH CAPTURE IN SELECT MODE
+// 1. HIT TEST (Pass touches unless selecting)
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    
-    // If we hit our own buttons (Menu, Toggle, etc.), let them work
     if ([hit isDescendantOfView:self.blurPanel] || hit == self.floatBtn) return hit;
-    
-    // If Selection Mode is ON, WE capture the touch (returning self).
-    // This allows the Gesture Recognizer to see the tap.
     if (isUISelectMode) return self;
-    
-    // Otherwise, return nil so the touch passes through to Instagram
     if (hit == self) return nil;
-    
     return hit;
 }
 
-// 2. CRITICAL: "PEEK-A-BOO" VIEW FINDER
+// 2. PEEK-A-BOO SELECTOR
 - (void)handleGlobalTap:(UITapGestureRecognizer *)tap {
     if (!isUISelectMode) return;
-    
     CGPoint loc = [tap locationInView:self.window];
-    
-    // A. Hide ourselves so the system ignores us
     self.hidden = YES;
-    
-    // B. Ask the window what is truly underneath at that point
     UIView *hitView = [self.window hitTest:loc withEvent:nil];
-    
-    // C. Re-appear immediately
     self.hidden = NO;
-    
-    // D. Select it
-    if (hitView) {
-        [self selectTargetView:hitView];
-    }
+    if (hitView) [self selectTargetView:hitView];
 }
 
 - (void)selectTargetView:(UIView *)v {
     self.targetView = v;
-    
-    // Highlight Box
     if (!self.selectedHighlight) {
         self.selectedHighlight = [[UIView alloc] initWithFrame:CGRectZero];
         self.selectedHighlight.layer.borderColor = [UIColor redColor].CGColor;
@@ -185,11 +184,9 @@ void savePrefs() {
     self.selectedHighlight.frame = [v convertRect:v.bounds toView:nil];
     self.selectedHighlight.hidden = NO;
     
-    // Show Info
     NSString *cls = NSStringFromClass([v class]);
     self.editorInfo.text = [NSString stringWithFormat:@"Target: %@", cls];
     
-    // Text Editor Logic
     if ([v respondsToSelector:@selector(setText:)]) {
         NSString *txt = [v performSelector:@selector(text)];
         self.textEditField.text = txt ? txt : @"";
@@ -199,8 +196,6 @@ void savePrefs() {
         self.textEditField.hidden = YES;
         self.setTextBtn.hidden = YES;
     }
-    
-    // Turn off selection mode and show menu
     [self toggleEditorMode]; 
     self.blurPanel.hidden = NO;
 }
@@ -225,7 +220,7 @@ void savePrefs() {
     [self.loadedLibraries sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
 }
 
-// --- UI BUILDER ---
+// --- UI SETUP ---
 - (void)setupUI {
     self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatBtn.frame = CGRectMake(self.frame.size.width - 70, 100, 50, 50);
@@ -249,7 +244,7 @@ void savePrefs() {
     [self addSubview:self.blurPanel];
     self.contentView = self.blurPanel.contentView;
 
-    self.tabs = [[UISegmentedControl alloc] initWithItems:@[@"ID", @"Class", @"Libs", @"Log", @"Edit"]];
+    self.tabs = [[UISegmentedControl alloc] initWithItems:@[@"ID", @"Class", @"Bin", @"Log", @"Edit"]];
     self.tabs.frame = CGRectMake(10, 10, self.contentView.frame.size.width - 20, 30);
     self.tabs.selectedSegmentIndex = 0;
     self.tabs.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.5];
@@ -266,7 +261,7 @@ void savePrefs() {
     [self setupEditorView];
 }
 
-// --- TAB SETUPS ---
+// --- TABS ---
 - (void)setupIdentityView {
     self.identityView = [[UIView alloc] initWithFrame:CGRectMake(0, 50, self.contentView.frame.size.width, 450)];
     [self.contentView addSubview:self.identityView];
@@ -285,7 +280,6 @@ void savePrefs() {
     [self.identityView addSubview:self.latField]; [self.identityView addSubview:self.lngField];
     [self makeBtn:@"TELEPORT NOW" y:280 col:THEME_COLOR sel:@selector(doTeleport) parent:self.identityView];
 }
-
 - (void)setupInspectorView {
     self.inspectorView = [[UIView alloc] initWithFrame:self.identityView.frame]; self.inspectorView.hidden = YES;
     [self.contentView addSubview:self.inspectorView];
@@ -298,16 +292,17 @@ void savePrefs() {
     self.classTable.delegate = self; self.classTable.dataSource = self;
     [self.inspectorView addSubview:self.classTable];
 }
-
 - (void)setupLibraryView {
     self.libraryView = [[UIView alloc] initWithFrame:self.identityView.frame]; self.libraryView.hidden = YES;
     [self.contentView addSubview:self.libraryView];
+    UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(15, 0, 200, 20)];
+    h.text = @"TAP MODULE TO ANALYZE"; h.textColor = THEME_COLOR; h.font = [UIFont boldSystemFontOfSize:10];
+    [self.libraryView addSubview:h];
     self.libraryTable = [[UITableView alloc] initWithFrame:CGRectMake(0, 25, self.libraryView.frame.size.width, 400)];
     self.libraryTable.backgroundColor = [UIColor clearColor];
     self.libraryTable.delegate = self; self.libraryTable.dataSource = self;
     [self.libraryView addSubview:self.libraryTable];
 }
-
 - (void)setupTerminalView {
     self.terminalView = [[UIView alloc] initWithFrame:self.identityView.frame]; self.terminalView.hidden = YES;
     [self.contentView addSubview:self.terminalView];
@@ -320,7 +315,6 @@ void savePrefs() {
     self.consoleView.editable = NO;
     [self.terminalView addSubview:self.consoleView];
 }
-
 - (void)setupEditorView {
     self.editorView = [[UIView alloc] initWithFrame:self.identityView.frame]; self.editorView.hidden = YES;
     [self.contentView addSubview:self.editorView];
@@ -349,7 +343,7 @@ void savePrefs() {
     [self makeBtn:@"DELETE OBJECT" y:250 col:[UIColor systemRedColor] sel:@selector(doRemoveView) parent:self.editorView];
 }
 
-// --- HELPERS & LOGIC ---
+// Helpers
 - (UIButton *)makeBtn:(NSString*)t y:(CGFloat)y col:(UIColor*)c sel:(SEL)s parent:(UIView*)p {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.frame = CGRectMake(20, y, p.frame.size.width - 40, 40);
@@ -363,6 +357,8 @@ void savePrefs() {
     tf.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0]; tf.textColor = [UIColor whiteColor];
     tf.placeholder = place; tf.layer.cornerRadius = 6; tf.delegate = self; return tf;
 }
+
+// Logic
 - (void)toggleMenu { self.blurPanel.hidden = !self.blurPanel.hidden; if(self.blurPanel.hidden) [self endEditing:YES]; }
 - (void)tabChanged {
     self.identityView.hidden = (self.tabs.selectedSegmentIndex != 0);
@@ -410,6 +406,35 @@ void savePrefs() {
         [self.consoleView scrollRangeToVisible:NSMakeRange(self.consoleView.text.length - 1, 1)];
     });
 }
+- (void)log:(NSString *)txt { [self handleLog:[NSNotification notificationWithName:@"L" object:txt]]; }
+
+// --- THE READABLE ENGINE ---
+- (void)makeDylibReadable:(NSString *)dylibName {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        NSString *name = [NSString stringWithUTF8String:_dyld_get_image_name(i)];
+        if ([name.lastPathComponent isEqualToString:dylibName]) {
+            const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            [self log:[NSString stringWithFormat:@"\n[*] READING MEMORY AT: %p", header]];
+            
+            // Read 256 bytes of header
+            unsigned char *buffer = (unsigned char *)header;
+            NSMutableString *hexDump = [NSMutableString stringWithString:@"\n[RAW HEX STREAM]\n"];
+            for (int j = 0; j < 256; j++) {
+                [hexDump appendFormat:@"%02X ", buffer[j]];
+                if ((j + 1) % 16 == 0) [hexDump appendString:@"\n"];
+            }
+            [self log:hexDump];
+            [self log:@"\n[✓] Segment is READABLE. Code Executable."];
+            
+            self.tabs.selectedSegmentIndex = 3; // Log Tab
+            [self tabChanged];
+            return;
+        }
+    }
+}
+
+// TableView Logic
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s {
     if (t == self.classTable) return self.filteredClasses.count;
     if (t == self.libraryTable) return self.loadedLibraries.count;
@@ -430,14 +455,23 @@ void savePrefs() {
     if (t == self.classTable) {
         Class c = objc_getClass([self.filteredClasses[p.row] UTF8String]);
         unsigned int count; Method *m = class_copyMethodList(c, &count);
-        [self handleLog:[NSNotification notificationWithName:@"L" object:[NSString stringWithFormat:@"\n[*] DUMP: %@", self.filteredClasses[p.row]]]];
-        for (int i=0; i<count; i++) [self handleLog:[NSNotification notificationWithName:@"L" object:[NSString stringWithFormat:@" - %@", NSStringFromSelector(method_getName(m[i]))]]];
+        [self log:[NSString stringWithFormat:@"\n[*] DUMP: %@", self.filteredClasses[p.row]]];
+        for (int i=0; i<count; i++) [self log:[NSString stringWithFormat:@" - %@", NSStringFromSelector(method_getName(m[i]))]];
         free(m); self.tabs.selectedSegmentIndex = 3; [self tabChanged];
     }
     if (t == self.libraryTable) {
         NSString *lib = self.loadedLibraries[p.row];
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Module Info" message:[NSString stringWithFormat:@"Module: %@\nLoad Address: Check Debugger", lib] preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Action" message:lib preferredStyle:UIAlertControllerStyleActionSheet];
+        [a addAction:[UIAlertAction actionWithTitle:@"Analyze Header" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            NSString *rep = analyzeBinaryEncryption(lib);
+            UIAlertController *b = [UIAlertController alertControllerWithTitle:@"Report" message:rep preferredStyle:UIAlertControllerStyleAlert];
+            [b addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+            [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:b animated:YES completion:nil];
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Read Raw Memory (Hex)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+            [self makeDylibReadable:lib];
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
         [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
     }
 }
@@ -494,7 +528,7 @@ int new_sysctlbyname(const char *n, void *o, size_t *ol, void *np, size_t nl) {
     loadPrefs();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = [UIApplication sharedApplication].keyWindow;
-        if (!w) for(UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) if(s.activationState==0) for(UIWindow* win in s.windows) if(win.isKeyWindow) w=win;
+        if(!w) for(UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) if(s.activationState==0) for(UIWindow* win in s.windows) if(win.isKeyWindow) w=win;
         if(w) [w addSubview:[[EnigmaMenu alloc] initWithFrame:w.bounds]];
         
         void *mg = dlsym(RTLD_DEFAULT, "MGCopyAnswer");
