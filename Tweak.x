@@ -30,6 +30,7 @@ void loggerWrite(NSString *fmt, ...) {
 
 // --- MAIN MENU INTERFACE ---
 @interface EnigmaMenu : UIView
+@property (nonatomic, strong) UIButton *floatBtn; // We need this property to check hits
 @property (nonatomic, strong) UIView *blurPanel;
 @property (nonatomic, strong) UITextView *consoleView;
 @property (nonatomic, strong) UISwitch *loggerToggle;
@@ -46,24 +47,34 @@ void loggerWrite(NSString *fmt, ...) {
     return self;
 }
 
+// --- FIXED HIT TEST ---
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
+    
+    // 1. If we tapped the Floating Button, KEEP IT.
+    if (hit == self.floatBtn) return hit;
+    
+    // 2. If we tapped inside the Menu Panel, KEEP IT.
     if ([hit isDescendantOfView:self.blurPanel]) return hit;
+    
+    // 3. Otherwise, pass touch to Snapchat.
     return nil;
 }
 
 - (void)setupUI {
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-    btn.frame = CGRectMake(self.frame.size.width - 60, 100, 50, 50);
-    btn.backgroundColor = [UIColor blackColor];
-    btn.layer.cornerRadius = 25;
-    btn.layer.borderWidth = 2;
-    btn.layer.borderColor = THEME_COLOR.CGColor;
-    [btn setTitle:@"Ω" forState:UIControlStateNormal];
-    [btn setTitleColor:THEME_COLOR forState:UIControlStateNormal];
-    [btn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:btn];
+    // 1. Floating Button
+    self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.floatBtn.frame = CGRectMake(self.frame.size.width - 60, 100, 50, 50);
+    self.floatBtn.backgroundColor = [UIColor blackColor];
+    self.floatBtn.layer.cornerRadius = 25;
+    self.floatBtn.layer.borderWidth = 2;
+    self.floatBtn.layer.borderColor = THEME_COLOR.CGColor;
+    [self.floatBtn setTitle:@"Ω" forState:UIControlStateNormal];
+    [self.floatBtn setTitleColor:THEME_COLOR forState:UIControlStateNormal];
+    [self.floatBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.floatBtn];
 
+    // 2. Main Panel
     self.blurPanel = [[UIView alloc] initWithFrame:CGRectMake(20, 160, self.frame.size.width - 40, 400)];
     self.blurPanel.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
     self.blurPanel.layer.cornerRadius = 15;
@@ -72,17 +83,20 @@ void loggerWrite(NSString *fmt, ...) {
     self.blurPanel.hidden = YES;
     [self addSubview:self.blurPanel];
 
+    // 3. Logger Header
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 15, 200, 20)];
     title.text = @"CLASS LOGGER";
     title.textColor = THEME_COLOR;
     title.font = [UIFont boldSystemFontOfSize:16];
     [self.blurPanel addSubview:title];
 
+    // 4. Toggle
     self.loggerToggle = [[UISwitch alloc] initWithFrame:CGRectMake(self.blurPanel.frame.size.width - 70, 10, 50, 30)];
     self.loggerToggle.onTintColor = THEME_COLOR;
     [self.loggerToggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
     [self.blurPanel addSubview:self.loggerToggle];
 
+    // 5. Console
     self.consoleView = [[UITextView alloc] initWithFrame:CGRectMake(15, 60, self.blurPanel.frame.size.width - 30, 260)];
     self.consoleView.backgroundColor = [UIColor blackColor];
     self.consoleView.textColor = [UIColor greenColor];
@@ -96,6 +110,7 @@ void loggerWrite(NSString *fmt, ...) {
     
     globalConsole = self.consoleView;
 
+    // 6. Buttons
     UIButton *copyBtn = [self makeBtn:@"[ COPY LOG ]" x:15 y:340];
     [copyBtn addTarget:self action:@selector(doCopy) forControlEvents:UIControlEventTouchUpInside];
     
@@ -115,7 +130,11 @@ void loggerWrite(NSString *fmt, ...) {
     return b;
 }
 
-- (void)toggleMenu { self.blurPanel.hidden = !self.blurPanel.hidden; }
+- (void)toggleMenu { 
+    self.blurPanel.hidden = !self.blurPanel.hidden; 
+    // Ensure panel is on top when opened
+    if (!self.blurPanel.hidden) [self bringSubviewToFront:self.blurPanel];
+}
 - (void)toggleChanged:(UISwitch *)s { 
     isLoggerActive = s.on; 
     loggerWrite(isLoggerActive ? @"[*] LOGGER STARTED." : @"[*] LOGGER PAUSED.");
@@ -126,7 +145,6 @@ void loggerWrite(NSString *fmt, ...) {
 @end
 
 // --- THE HOOKS ---
-
 %hook SCONeTapLoginMultiAccountLandingPage
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -142,14 +160,11 @@ void loggerWrite(NSString *fmt, ...) {
 
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
     %orig;
-    // FIX: Cast self to UIViewController so the compiler sees the .view property
     UIViewController *controller = (UIViewController *)self;
-    
     UITouch *t = [touches anyObject];
     CGPoint p = [t locationInView:controller.view];
     loggerWrite(@"[TOUCH] Tapped at {%.0f, %.0f}", p.x, p.y);
 }
-
 %end
 
 %ctor {
