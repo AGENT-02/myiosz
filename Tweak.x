@@ -1,38 +1,17 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 #import <dlfcn.h>
+#import <objc/runtime.h> // Required for "Dump" features
 
-// --- PREFERENCE KEYS ---
-#define kUUIDKey @"EnigmaSavedUUID"
-#define kUDIDKey @"EnigmaSavedUDID"
+// --- CONFIG ---
+static BOOL isMenuOpen = NO;
 
-// --- GLOBAL STORAGE ---
-static NSString *fakeUUID = nil;
-static NSString *fakeUDID = nil;
-
-// --- PERSISTENCE HELPERS ---
-void loadPreferences() {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    fakeUUID = [defaults stringForKey:kUUIDKey];
-    fakeUDID = [defaults stringForKey:kUDIDKey];
-    
-    // Set defaults if running for the first time
-    if (!fakeUUID) fakeUUID = @"E621E1F8-C36C-495A-93FC-0C247A3E6E5F";
-    if (!fakeUDID) fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
-}
-
-void savePreferences() {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setObject:fakeUUID forKey:kUUIDKey];
-    [defaults setObject:fakeUDID forKey:kUDIDKey];
-    [defaults synchronize]; // Force save to disk
-}
-
-// --- UI INTERFACE ---
-@interface EnigmaOverlay : UIView
+// --- UI COMPONENTS ---
+@interface EnigmaOverlay : UIView <UITextFieldDelegate>
 @property (nonatomic, strong) UIButton *cornerBtn;
 @property (nonatomic, strong) UIView *menuView;
-@property (nonatomic, strong) UILabel *infoLabel;
+@property (nonatomic, strong) UITextView *terminalView; // The "Black Screen"
+@property (nonatomic, strong) UITextField *inputField;  // Search bar
 @end
 
 @implementation EnigmaOverlay
@@ -54,137 +33,119 @@ void savePreferences() {
 }
 
 - (void)setupUI {
-    // Corner Button
+    // 1. Toggle Button
     self.cornerBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.cornerBtn.frame = CGRectMake(self.frame.size.width - 65, 80, 50, 50);
-    self.cornerBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
+    self.cornerBtn.frame = CGRectMake(self.frame.size.width - 60, 80, 50, 50);
+    self.cornerBtn.backgroundColor = [UIColor blackColor];
     self.cornerBtn.layer.cornerRadius = 25;
+    self.cornerBtn.layer.borderColor = [UIColor greenColor].CGColor;
     self.cornerBtn.layer.borderWidth = 2;
-    self.cornerBtn.layer.borderColor = [UIColor redColor].CGColor; // Red = "Ready to Restart"
-    [self.cornerBtn setTitle:@"Ω" forState:UIControlStateNormal];
+    [self.cornerBtn setTitle:@"TERMINAL" forState:UIControlStateNormal];
+    self.cornerBtn.titleLabel.font = [UIFont systemFontOfSize:8];
     [self.cornerBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.cornerBtn];
 
-    // Menu Container
-    self.menuView = [[UIView alloc] initWithFrame:CGRectMake(25, 140, self.frame.size.width - 50, 320)];
-    self.menuView.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.98];
-    self.menuView.layer.cornerRadius = 18;
+    // 2. The Menu (Terminal Style)
+    self.menuView = [[UIView alloc] initWithFrame:CGRectMake(20, 140, self.frame.size.width - 40, 400)];
+    self.menuView.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.05 alpha:0.95];
+    self.menuView.layer.cornerRadius = 15;
+    self.menuView.layer.borderColor = [UIColor greenColor].CGColor;
     self.menuView.layer.borderWidth = 1;
-    self.menuView.layer.borderColor = [UIColor redColor].CGColor;
     self.menuView.hidden = YES;
     [self addSubview:self.menuView];
 
-    // Header
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(0, 15, self.menuView.frame.size.width, 25)];
-    t.text = @"ENIGMA PERSIST";
-    t.textAlignment = NSTextAlignmentCenter;
-    t.textColor = [UIColor whiteColor];
-    t.font = [UIFont boldSystemFontOfSize:16];
-    [self.menuView addSubview:t];
+    // 3. Input Field (Class Name Search)
+    self.inputField = [[UITextField alloc] initWithFrame:CGRectMake(15, 15, self.menuView.frame.size.width - 110, 35)];
+    self.inputField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    self.inputField.textColor = [UIColor whiteColor];
+    self.inputField.placeholder = @" Enter Class (e.g. UIDevice)";
+    self.inputField.layer.cornerRadius = 8;
+    self.inputField.delegate = self;
+    [self.menuView addSubview:self.inputField];
 
-    // Info Label
-    self.infoLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, self.menuView.frame.size.width - 40, 50)];
-    self.infoLabel.numberOfLines = 2;
-    self.infoLabel.textColor = [UIColor lightGrayColor];
-    self.infoLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
-    [self updateLabels];
-    [self.menuView addSubview:self.infoLabel];
+    // 4. Dump Button
+    UIButton *dumpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    dumpBtn.frame = CGRectMake(self.menuView.frame.size.width - 85, 15, 70, 35);
+    dumpBtn.backgroundColor = [UIColor greenColor];
+    dumpBtn.layer.cornerRadius = 8;
+    [dumpBtn setTitle:@"DUMP" forState:UIControlStateNormal];
+    [dumpBtn setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+    [dumpBtn addTarget:self action:@selector(runDump) forControlEvents:UIControlEventTouchUpInside];
+    [self.menuView addSubview:dumpBtn];
 
-    // Buttons
-    [self makeBtn:@"Rotate UUID & Restart" y:110 col:[UIColor systemBlueColor] sel:@selector(doUUID)];
-    [self makeBtn:@"Rotate UDID & Restart" y:165 col:[UIColor systemIndigoColor] sel:@selector(doUDID)];
-    [self makeBtn:@"Cancel / Close" y:240 col:[UIColor darkGrayColor] sel:@selector(toggleMenu)];
-}
-
-- (void)makeBtn:(NSString*)txt y:(CGFloat)y col:(UIColor*)col sel:(SEL)sel {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame = CGRectMake(20, y, self.menuView.frame.size.width - 40, 45);
-    b.backgroundColor = col;
-    b.layer.cornerRadius = 12;
-    [b setTitle:txt forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
-    [self.menuView addSubview:b];
+    // 5. Terminal Output View (Scrolling logs)
+    self.terminalView = [[UITextView alloc] initWithFrame:CGRectMake(15, 60, self.menuView.frame.size.width - 30, 325)];
+    self.terminalView.backgroundColor = [UIColor blackColor];
+    self.terminalView.textColor = [UIColor greenColor];
+    self.terminalView.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    self.terminalView.editable = NO;
+    self.terminalView.text = @"[Enigma Shell v1.0] Ready...\nWaiting for input...\n";
+    [self.menuView addSubview:self.terminalView];
 }
 
 - (void)toggleMenu {
     self.menuView.hidden = !self.menuView.hidden;
+    if (!self.menuView.hidden) {
+        [self.terminalView becomeFirstResponder]; // Little trick to focus
+    } else {
+        [self.inputField resignFirstResponder];
+    }
 }
 
-- (void)updateLabels {
-    self.infoLabel.text = [NSString stringWithFormat:@"UUID: ...%@\nUDID: ...%@", 
-        [fakeUUID substringFromIndex:MAX(0, (int)fakeUUID.length-12)], 
-        [fakeUDID substringFromIndex:MAX(0, (int)fakeUDID.length-12)]];
+// --- THE CORE DUMP LOGIC ---
+// This uses Objective-C Runtime to inspect memory
+- (void)runDump {
+    [self.inputField resignFirstResponder];
+    NSString *className = self.inputField.text;
+    if (className.length == 0) return;
+
+    [self logToTerminal:[NSString stringWithFormat:@"\n[*] Targeting Class: %@...", className]];
+
+    Class targetClass = objc_getClass([className UTF8String]);
+    if (!targetClass) {
+        [self logToTerminal:@"[!] Error: Class not found in memory."];
+        return;
+    }
+
+    // 1. Get Method List
+    unsigned int methodCount = 0;
+    Method *methods = class_copyMethodList(targetClass, &methodCount);
+
+    [self logToTerminal:[NSString stringWithFormat:@"[+] Found %d methods:\n", methodCount]];
+
+    for (unsigned int i = 0; i < methodCount; i++) {
+        Method method = methods[i];
+        SEL methodSelector = method_getName(method);
+        NSString *methodName = NSStringFromSelector(methodSelector);
+        
+        // Print to our "Terminal"
+        [self logToTerminal:[NSString stringWithFormat:@"   - %@", methodName]];
+    }
+
+    free(methods);
+    [self logToTerminal:@"\n[✓] Dump Complete."];
 }
 
-// --- ACTION LOGIC ---
-
-- (void)doUUID {
-    fakeUUID = [[NSUUID UUID] UUIDString];
-    savePreferences(); // Save before killing app
-    
-    // Haptic Feedback
-    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy] impactOccurred];
-    
-    // Immediate Restart (Crash)
-    exit(0); 
+- (void)logToTerminal:(NSString *)text {
+    self.terminalView.text = [self.terminalView.text stringByAppendingFormat:@"%@\n", text];
+    // Auto-scroll to bottom
+    if(self.terminalView.text.length > 0) {
+        NSRange bottom = NSMakeRange(self.terminalView.text.length - 1, 1);
+        [self.terminalView scrollRangeToVisible:bottom];
+    }
 }
 
-- (void)doUDID {
-    NSString *pool = @"abcdef0123456789";
-    NSMutableString *s = [NSMutableString stringWithCapacity:40];
-    for (int i=0; i<40; i++) [s appendFormat:@"%C", [pool characterAtIndex:arc4random_uniform(16)]];
-    fakeUDID = s;
-    savePreferences(); // Save before killing app
-    
-    // Haptic Feedback
-    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy] impactOccurred];
-    
-    // Immediate Restart (Crash)
-    exit(0);
+// Close keyboard on Return
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    return YES;
 }
 @end
 
-// --- HOOKS ---
-
-%hook UIDevice
-- (NSUUID *)identifierForVendor {
-    return [[NSUUID alloc] initWithUUIDString:fakeUUID];
-}
-%end
-
-static CFPropertyListRef (*old_MGCopyAnswer)(CFStringRef property);
-CFPropertyListRef new_MGCopyAnswer(CFStringRef property) {
-    if (property && CFStringCompare(property, CFSTR("UniqueDeviceID"), 0) == kCFCompareEqualTo) {
-        return (__bridge CFPropertyListRef)fakeUDID;
-    }
-    return old_MGCopyAnswer(property);
-}
-
-// --- INITIALIZATION ---
 %ctor {
-    // 1. Load saved IDs immediately on launch
-    loadPreferences();
-    
-    // 2. Wait 10s before injecting UI or Risky Hooks
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @try {
-            UIWindow *w = nil;
-            for (UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) {
-                if (s.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *win in s.windows) if (win.isKeyWindow) { w = win; break; }
-                }
-            }
-            if (!w) w = [UIApplication sharedApplication].keyWindow;
-            if (w) [w addSubview:[[EnigmaOverlay alloc] initWithFrame:w.bounds]];
-            
-            // Apply UDID hook safely
-            void *mgAddress = dlsym(RTLD_DEFAULT, "MGCopyAnswer");
-            if (mgAddress) {
-                MSHookFunction(mgAddress, (void *)new_MGCopyAnswer, (void **)&old_MGCopyAnswer);
-            }
-        } @catch (NSException *e) {}
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *w = [UIApplication sharedApplication].keyWindow;
+        if (w) [w addSubview:[[EnigmaOverlay alloc] initWithFrame:w.bounds]];
     });
-    
     %init;
 }
