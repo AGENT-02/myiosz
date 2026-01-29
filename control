@@ -1,0 +1,9 @@
+Package: com.yourname.enigmajailed
+Name: Enigma Jailed
+Depends: mobilesubstrate
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Identity modification for iOS 26.2 (Jailed)
+Maintainer: YourName
+Author: YourName
+Section: Tweaks
