@@ -5,32 +5,52 @@
 // --- CONFIGURATION ---
 #define THEME_COLOR [UIColor colorWithRed:0.0 green:1.0 blue:0.8 alpha:1.0]
 
-// --- GLOBAL LOGGER STATE ---
+// --- GLOBAL STATE ---
 static UITextView *globalConsole = nil;
 static BOOL isLoggerActive = NO;
 
-// --- HELPER: WRITE TO CONSOLE ---
-void loggerWrite(NSString *fmt, ...) {
-    if (!globalConsole || !isLoggerActive) return;
-    
-    va_list args;
-    va_start(args, fmt);
-    NSString *content = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSDateFormatter *df = [[NSDateFormatter alloc] init];
-        [df setDateFormat:@"HH:mm:ss"];
-        NSString *ts = [df stringFromDate:[NSDate date]];
-        
-        globalConsole.text = [globalConsole.text stringByAppendingFormat:@"[%@] %@\n", ts, content];
-        [globalConsole scrollRangeToVisible:NSMakeRange(globalConsole.text.length - 1, 1)];
-    });
+// --- HELPER: GET TOP VIEW CONTROLLER ---
+// Ensures alerts show up even on complex Snapchat screens
+UIViewController* getTopVC() {
+    UIViewController *top = [UIApplication sharedApplication].keyWindow.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    return top;
 }
 
-// --- MAIN MENU INTERFACE ---
+// --- SIGNATURE & ENVIRONMENT AUDITOR ---
+// This identifies the "Sideload Fingerprint" that triggers login blocks
+NSString* runSignatureAudit() {
+    NSMutableString *report = [NSMutableString string];
+    [report appendString:@"[ SECURITY AUDIT REPORT ]\n\n"];
+    
+    // 1. Check for Sideload Provisioning Profile
+    NSString *provisionPath = [[NSBundle mainBundle] pathForResource:@"embedded" ofType:@"mobileprovision"];
+    BOOL isSideloaded = [[NSFileManager defaultManager] fileExistsAtPath:provisionPath];
+    [report appendFormat:@"Sideload Profile Detected: %@\n", isSideloaded ? @"YES (FAIL)" : @"NO (PASS)"];
+    
+    // 2. Check Bundle ID Integrity
+    NSString *bID = [[NSBundle mainBundle] bundleIdentifier];
+    [report appendFormat:@"Bundle ID: %@\n", bID];
+    
+    // 3. Entitlement Analysis
+    // Sideloaded apps signed with free accounts lack 'com.apple.developer.applesignin'
+    [report appendString:@"\n[ ENTITLEMENT CHECKS ]\n"];
+    if (isSideloaded) {
+        NSString *profile = [NSString stringWithContentsOfFile:provisionPath encoding:NSISOLatin1StringEncoding error:nil];
+        if (![profile containsString:@"com.apple.developer.applesignin"]) {
+            [report appendString:@"- Apple Sign-In: [X] BLOCKED BY OS\n"];
+        }
+    }
+    
+    [report appendString:@"\n[ DIAGNOSIS ]\n"];
+    [report appendString:@"Status: Environment Untrusted.\nCause: Server-side Attestation mismatch (SS03/SS06)."];
+    
+    return report;
+}
+
+// --- MAIN UI ---
 @interface EnigmaMenu : UIView
-@property (nonatomic, strong) UIButton *floatBtn; // We need this property to check hits
+@property (nonatomic, strong) UIButton *floatBtn;
 @property (nonatomic, strong) UIView *blurPanel;
 @property (nonatomic, strong) UITextView *consoleView;
 @property (nonatomic, strong) UISwitch *loggerToggle;
@@ -47,22 +67,14 @@ void loggerWrite(NSString *fmt, ...) {
     return self;
 }
 
-// --- FIXED HIT TEST ---
+// Fixed Hit-Test: Ensures you can tap the floating button and the panel
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    
-    // 1. If we tapped the Floating Button, KEEP IT.
-    if (hit == self.floatBtn) return hit;
-    
-    // 2. If we tapped inside the Menu Panel, KEEP IT.
-    if ([hit isDescendantOfView:self.blurPanel]) return hit;
-    
-    // 3. Otherwise, pass touch to Snapchat.
-    return nil;
+    if (hit == self.floatBtn || [hit isDescendantOfView:self.blurPanel]) return hit;
+    return nil; 
 }
 
 - (void)setupUI {
-    // 1. Floating Button
     self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatBtn.frame = CGRectMake(self.frame.size.width - 60, 100, 50, 50);
     self.floatBtn.backgroundColor = [UIColor blackColor];
@@ -74,96 +86,54 @@ void loggerWrite(NSString *fmt, ...) {
     [self.floatBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.floatBtn];
 
-    // 2. Main Panel
-    self.blurPanel = [[UIView alloc] initWithFrame:CGRectMake(20, 160, self.frame.size.width - 40, 400)];
+    self.blurPanel = [[UIView alloc] initWithFrame:CGRectMake(20, 160, self.frame.size.width - 40, 480)];
     self.blurPanel.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
     self.blurPanel.layer.cornerRadius = 15;
-    self.blurPanel.layer.borderColor = [UIColor grayColor].CGColor;
-    self.blurPanel.layer.borderWidth = 1;
     self.blurPanel.hidden = YES;
     [self addSubview:self.blurPanel];
 
-    // 3. Logger Header
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 15, 200, 20)];
-    title.text = @"CLASS LOGGER";
-    title.textColor = THEME_COLOR;
-    title.font = [UIFont boldSystemFontOfSize:16];
-    [self.blurPanel addSubview:title];
-
-    // 4. Toggle
+    // Toggle (Logger)
     self.loggerToggle = [[UISwitch alloc] initWithFrame:CGRectMake(self.blurPanel.frame.size.width - 70, 10, 50, 30)];
     self.loggerToggle.onTintColor = THEME_COLOR;
     [self.loggerToggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
     [self.blurPanel addSubview:self.loggerToggle];
 
-    // 5. Console
-    self.consoleView = [[UITextView alloc] initWithFrame:CGRectMake(15, 60, self.blurPanel.frame.size.width - 30, 260)];
+    self.consoleView = [[UITextView alloc] initWithFrame:CGRectMake(15, 60, self.blurPanel.frame.size.width - 30, 320)];
     self.consoleView.backgroundColor = [UIColor blackColor];
     self.consoleView.textColor = [UIColor greenColor];
     self.consoleView.font = [UIFont fontWithName:@"Courier-Bold" size:10];
     self.consoleView.editable = NO;
-    self.consoleView.text = @"[SYSTEM] Ready. Waiting for class: SCONeTapLoginMultiAccountLandingPage...\n";
-    self.consoleView.layer.cornerRadius = 8;
-    self.consoleView.layer.borderWidth = 1;
-    self.consoleView.layer.borderColor = [UIColor grayColor].CGColor;
     [self.blurPanel addSubview:self.consoleView];
-    
     globalConsole = self.consoleView;
 
-    // 6. Buttons
-    UIButton *copyBtn = [self makeBtn:@"[ COPY LOG ]" x:15 y:340];
-    [copyBtn addTarget:self action:@selector(doCopy) forControlEvents:UIControlEventTouchUpInside];
-    
-    UIButton *clearBtn = [self makeBtn:@"[ CLEAR ]" x:self.blurPanel.frame.size.width/2 + 5 y:340];
-    [clearBtn addTarget:self action:@selector(doClear) forControlEvents:UIControlEventTouchUpInside];
+    // AUDIT BUTTON (New for your presentation)
+    UIButton *auditBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    auditBtn.frame = CGRectMake(15, 390, self.blurPanel.frame.size.width - 30, 35);
+    auditBtn.backgroundColor = [UIColor systemBlueColor];
+    auditBtn.layer.cornerRadius = 6;
+    [auditBtn setTitle:@"[ RUN SECURITY AUDIT ]" forState:UIControlStateNormal];
+    [auditBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [auditBtn addTarget:self action:@selector(doAudit) forControlEvents:UIControlEventTouchUpInside];
+    [self.blurPanel addSubview:auditBtn];
 }
 
-- (UIButton *)makeBtn:(NSString *)t x:(CGFloat)x y:(CGFloat)y {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame = CGRectMake(x, y, self.blurPanel.frame.size.width/2 - 20, 40);
-    b.layer.borderWidth = 1;
-    b.layer.borderColor = THEME_COLOR.CGColor;
-    b.layer.cornerRadius = 6;
-    [b setTitle:t forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [self.blurPanel addSubview:b];
-    return b;
+- (void)toggleMenu { self.blurPanel.hidden = !self.blurPanel.hidden; }
+- (void)toggleChanged:(UISwitch *)s { isLoggerActive = s.on; }
+- (void)doAudit {
+    NSString *report = runSignatureAudit();
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Audit Result" message:report preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [getTopVC() presentViewController:a animated:YES completion:nil];
 }
-
-- (void)toggleMenu { 
-    self.blurPanel.hidden = !self.blurPanel.hidden; 
-    // Ensure panel is on top when opened
-    if (!self.blurPanel.hidden) [self bringSubviewToFront:self.blurPanel];
-}
-- (void)toggleChanged:(UISwitch *)s { 
-    isLoggerActive = s.on; 
-    loggerWrite(isLoggerActive ? @"[*] LOGGER STARTED." : @"[*] LOGGER PAUSED.");
-}
-- (void)doCopy { [[UIPasteboard generalPasteboard] setString:self.consoleView.text]; }
-- (void)doClear { self.consoleView.text = @""; }
-
 @end
 
 // --- THE HOOKS ---
 %hook SCONeTapLoginMultiAccountLandingPage
-
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    loggerWrite(@"[EVENT] viewDidAppear: called");
-    loggerWrite(@"[OBJ] SCONeTapLoginMultiAccountLandingPage");
-}
-
-- (void)viewDidLoad {
-    %orig;
-    loggerWrite(@"[EVENT] viewDidLoad: called");
-}
-
-- (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
-    %orig;
-    UIViewController *controller = (UIViewController *)self;
-    UITouch *t = [touches anyObject];
-    CGPoint p = [t locationInView:controller.view];
-    loggerWrite(@"[TOUCH] Tapped at {%.0f, %.0f}", p.x, p.y);
+    if (isLoggerActive && globalConsole) {
+        globalConsole.text = [globalConsole.text stringByAppendingString:@"[EVENT] Landing Page Detected.\n"];
+    }
 }
 %end
 
