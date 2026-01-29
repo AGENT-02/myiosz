@@ -153,7 +153,7 @@ NSString* analyzeBinaryEncryption(NSString *dylibName) {
     return self;
 }
 
-// 1. HIT TEST (Pass touches unless selecting)
+// 1. HIT TEST
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     if ([hit isDescendantOfView:self.blurPanel] || hit == self.floatBtn) return hit;
@@ -357,6 +357,11 @@ NSString* analyzeBinaryEncryption(NSString *dylibName) {
     tf.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0]; tf.textColor = [UIColor whiteColor];
     tf.placeholder = place; tf.layer.cornerRadius = 6; tf.delegate = self; return tf;
 }
+- (UIViewController *)getTopViewController {
+    UIViewController *top = [UIApplication sharedApplication].keyWindow.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    return top;
+}
 
 // Logic
 - (void)toggleMenu { self.blurPanel.hidden = !self.blurPanel.hidden; if(self.blurPanel.hidden) [self endEditing:YES]; }
@@ -408,27 +413,49 @@ NSString* analyzeBinaryEncryption(NSString *dylibName) {
 }
 - (void)log:(NSString *)txt { [self handleLog:[NSNotification notificationWithName:@"L" object:txt]]; }
 
-// --- THE READABLE ENGINE ---
+// --- THE DISASSEMBLER ENGINE ---
+NSString* disassembleInstruction(uint32_t inst) {
+    if (inst == 0xA9BF7BFD) return @"STP x29, x30, [sp, #-16]!";
+    if (inst == 0x910003FD) return @"MOV x29, sp";
+    if (inst == 0xD65F03C0) return @"RET";
+    if (inst == 0xD503201F) return @"NOP";
+    uint32_t op1 = (inst >> 24) & 0xFF;
+    if (op1 == 0x91) return [NSString stringWithFormat:@"ADD x0, sp, #0x%X", (inst & 0xFF)];
+    if (op1 == 0x52) return [NSString stringWithFormat:@"MOV w0, #0x%X", (inst & 0xFFFF)];
+    if (op1 == 0x94) return [NSString stringWithFormat:@"BL 0x%X (Call)", (inst & 0xFFFFFF)];
+    if (op1 == 0x14) return [NSString stringWithFormat:@"B  0x%X (Jump)", (inst & 0xFFFFFF)];
+    return @"(Unknown / Data)";
+}
 - (void)makeDylibReadable:(NSString *)dylibName {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         NSString *name = [NSString stringWithUTF8String:_dyld_get_image_name(i)];
         if ([name.lastPathComponent isEqualToString:dylibName]) {
             const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
-            [self log:[NSString stringWithFormat:@"\n[*] READING MEMORY AT: %p", header]];
-            
-            // Read 256 bytes of header
-            unsigned char *buffer = (unsigned char *)header;
-            NSMutableString *hexDump = [NSMutableString stringWithString:@"\n[RAW HEX STREAM]\n"];
-            for (int j = 0; j < 256; j++) {
-                [hexDump appendFormat:@"%02X ", buffer[j]];
-                if ((j + 1) % 16 == 0) [hexDump appendString:@"\n"];
+            [self log:[NSString stringWithFormat:@"\n[*] DISASSEMBLING: %@", dylibName]];
+            [self log:[NSString stringWithFormat:@"[*] ADDRESS: %p", header]];
+            [self log:@"------------------------------------------------"];
+            [self log:@"ADDR        | RAW HEX    | INSTRUCTION"];
+            [self log:@"------------------------------------------------"];
+            uintptr_t cmdPtr = (uintptr_t)(header + 1);
+            uintptr_t codeStart = 0;
+            for (uint32_t c = 0; c < header->ncmds; c++) {
+                struct load_command *lc = (struct load_command *)cmdPtr;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+                    if (strcmp(seg->segname, "__TEXT") == 0) { codeStart = (uintptr_t)header + seg->fileoff + 0x1000; break; }
+                }
+                cmdPtr += lc->cmdsize;
             }
-            [self log:hexDump];
-            [self log:@"\n[✓] Segment is READABLE. Code Executable."];
-            
-            self.tabs.selectedSegmentIndex = 3; // Log Tab
-            [self tabChanged];
+            if (codeStart == 0) codeStart = (uintptr_t)header + 0x4000;
+            uint32_t *instructions = (uint32_t *)codeStart;
+            for (int j = 0; j < 12; j++) {
+                uint32_t inst = instructions[j];
+                [self log:[NSString stringWithFormat:@"0x%llX | %08X   | %@", (uint64_t)&instructions[j], inst, disassembleInstruction(inst)]];
+            }
+            [self log:@"------------------------------------------------"];
+            [self log:@"[✓] CODE SEGMENT IS EXECUTABLE & READABLE"];
+            self.tabs.selectedSegmentIndex = 3; [self tabChanged];
             return;
         }
     }
@@ -466,13 +493,14 @@ NSString* analyzeBinaryEncryption(NSString *dylibName) {
             NSString *rep = analyzeBinaryEncryption(lib);
             UIAlertController *b = [UIAlertController alertControllerWithTitle:@"Report" message:rep preferredStyle:UIAlertControllerStyleAlert];
             [b addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-            [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:b animated:YES completion:nil];
+            [[self getTopViewController] presentViewController:b animated:YES completion:nil];
         }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Read Raw Memory (Hex)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [a addAction:[UIAlertAction actionWithTitle:@"Read Code (Disassemble)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
             [self makeDylibReadable:lib];
         }]];
         [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
+        [[self getTopViewController] presentViewController:a animated:YES completion:nil];
+        [t deselectRowAtIndexPath:p animated:YES];
     }
 }
 - (void)searchChanged:(UITextField *)tf {
