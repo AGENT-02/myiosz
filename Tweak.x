@@ -2,256 +2,412 @@
 #import <substrate.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
-#import <mach-o/dyld.h> // Required to find app classes
+#import <mach-o/dyld.h>
+#import <sys/sysctl.h>
 
-// --- UI CONFIG ---
-@interface EnigmaOverlay : UIView <UITextFieldDelegate, UITableViewDelegate, UITableViewDataSource>
-// UI Elements
-@property (nonatomic, strong) UIButton *cornerBtn;
-@property (nonatomic, strong) UIView *menuView;
-@property (nonatomic, strong) UITextView *terminalView;
-@property (nonatomic, strong) UITableView *classTableView; // The new List
-@property (nonatomic, strong) UITextField *inputField;
-@property (nonatomic, strong) UIButton *modeBtn; // Toggle between Terminal/Browser
+// --- CONFIGURATION ---
+#define kUUIDKey @"EnigmaSavedUUID"
+#define kUDIDKey @"EnigmaSavedUDID"
+#define THEME_COLOR [UIColor colorWithRed:0.0 green:1.0 blue:0.8 alpha:1.0] // Cyan/Teal
 
-// Data
-@property (nonatomic, strong) NSMutableArray *appClasses; // Stores the list of found classes
-@property (nonatomic, strong) NSMutableArray *filteredClasses; // For search filtering
+// --- GLOBAL STATE ---
+static NSString *fakeUUID = nil;
+static NSString *fakeUDID = nil;
+static char *fakeModel = "iPhone18,1"; // iOS 26.2 Standard
+static BOOL isNetMonEnabled = NO;
+
+// --- PERSISTENCE ---
+void loadPrefs() {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    fakeUUID = [d stringForKey:kUUIDKey];
+    fakeUDID = [d stringForKey:kUDIDKey];
+    if (!fakeUUID) fakeUUID = @"E621E1F8-C36C-495A-93FC-0C247A3E6E5F";
+    if (!fakeUDID) fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
+}
+
+void savePrefs() {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:fakeUUID forKey:kUUIDKey];
+    [d setObject:fakeUDID forKey:kUDIDKey];
+    [d synchronize];
+}
+
+// --- NETWORK LOGGER (SAFE) ---
+@interface EnigmaNetLogger : NSURLProtocol @end
+@implementation EnigmaNetLogger
++ (BOOL)canInitWithRequest:(NSURLRequest *)r {
+    if (!isNetMonEnabled) return NO;
+    if ([NSURLProtocol propertyForKey:@"EnigmaHandled" inRequest:r]) return NO;
+    return YES;
+}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
+- (void)startLoading {
+    NSMutableURLRequest *newReq = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"EnigmaHandled" inRequest:newReq];
+    
+    // Log to Notification Center
+    NSString *log = [NSString stringWithFormat:@"[REQ] %@: %@", newReq.HTTPMethod, newReq.URL.path];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"EnigmaLog" object:log];
+    
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+    [[session dataTaskWithRequest:newReq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (e) [self.client URLProtocol:self didFailWithError:e];
+        else {
+            [self.client URLProtocol:self didReceiveResponse:r cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:d];
+            [self.client URLProtocolDidFinishLoading:self];
+        }
+    }] resume];
+}
+- (void)stopLoading {}
 @end
 
-@implementation EnigmaOverlay
+// --- UI INTERFACE ---
+@interface EnigmaMenu : UIView <UITableViewDelegate, UITableViewDataSource, UITextFieldDelegate>
+// Core UI
+@property (nonatomic, strong) UIButton *floatBtn;
+@property (nonatomic, strong) UIVisualEffectView *blurPanel;
+@property (nonatomic, strong) UIView *contentView;
+@property (nonatomic, strong) UISegmentedControl *tabs;
+
+// Toast
+@property (nonatomic, strong) UILabel *toastLabel;
+
+// Tab 1: Identity
+@property (nonatomic, strong) UIView *identityView;
+@property (nonatomic, strong) UILabel *idInfoLabel;
+
+// Tab 2: Inspector
+@property (nonatomic, strong) UIView *inspectorView;
+@property (nonatomic, strong) UITextField *searchField;
+@property (nonatomic, strong) UITableView *classTable;
+@property (nonatomic, strong) NSMutableArray *allClasses;
+@property (nonatomic, strong) NSMutableArray *filteredClasses;
+
+// Tab 3: Terminal
+@property (nonatomic, strong) UIView *terminalView;
+@property (nonatomic, strong) UITextView *consoleView;
+@property (nonatomic, strong) UIButton *netToggleBtn;
+
+@end
+
+@implementation EnigmaMenu
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.userInteractionEnabled = YES;
-        self.backgroundColor = [UIColor clearColor];
-        [self loadAppClasses]; // Scan memory immediately
+        [self loadClasses];
         [self setupUI];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleLog:) name:@"EnigmaLog" object:nil];
     }
     return self;
 }
 
-// --- MEMORY SCANNER ---
-- (void)loadAppClasses {
-    self.appClasses = [NSMutableArray array];
-    
-    // 1. Get the name of the main executable (The App itself)
+- (void)loadClasses {
+    self.allClasses = [NSMutableArray array];
     const char *mainImage = _dyld_get_image_name(0);
-    
-    // 2. Get all classes defined in that executable
     unsigned int count = 0;
     const char **classes = objc_copyClassNamesForImage(mainImage, &count);
-    
     for (unsigned int i = 0; i < count; i++) {
-        NSString *className = [NSString stringWithUTF8String:classes[i]];
-        [self.appClasses addObject:className];
+        [self.allClasses addObject:[NSString stringWithUTF8String:classes[i]]];
     }
-    
     if (classes) free(classes);
-    
-    // Sort alphabetically for easy browsing
-    [self.appClasses sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-    self.filteredClasses = [NSMutableArray arrayWithArray:self.appClasses];
+    [self.allClasses sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    self.filteredClasses = [NSMutableArray arrayWithArray:self.allClasses];
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hitView = [super hitTest:point withEvent:event];
-    if (hitView == self) return nil;
-    return hitView;
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self) return nil;
+    return hit;
 }
 
 - (void)setupUI {
-    // 1. Corner Button
-    self.cornerBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.cornerBtn.frame = CGRectMake(self.frame.size.width - 60, 80, 50, 50);
-    self.cornerBtn.backgroundColor = [UIColor blackColor];
-    self.cornerBtn.layer.cornerRadius = 25;
-    self.cornerBtn.layer.borderColor = [UIColor greenColor].CGColor;
-    self.cornerBtn.layer.borderWidth = 2;
-    [self.cornerBtn setTitle:@">_" forState:UIControlStateNormal];
-    [self.cornerBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:self.cornerBtn];
+    // 1. Floating Button (Clean Look)
+    self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.floatBtn.frame = CGRectMake(self.frame.size.width - 70, 100, 50, 50);
+    self.floatBtn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
+    self.floatBtn.layer.cornerRadius = 25;
+    self.floatBtn.layer.borderWidth = 1.5;
+    self.floatBtn.layer.borderColor = THEME_COLOR.CGColor;
+    self.floatBtn.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.floatBtn.layer.shadowOpacity = 0.5;
+    self.floatBtn.layer.shadowOffset = CGSizeMake(0, 4);
+    [self.floatBtn setTitle:@"Ω" forState:UIControlStateNormal];
+    self.floatBtn.titleLabel.font = [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
+    [self.floatBtn setTitleColor:THEME_COLOR forState:UIControlStateNormal];
+    [self.floatBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.floatBtn];
 
-    // 2. Main Window
-    self.menuView = [[UIView alloc] initWithFrame:CGRectMake(20, 140, self.frame.size.width - 40, 500)];
-    self.menuView.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.05 alpha:0.98];
-    self.menuView.layer.cornerRadius = 15;
-    self.menuView.layer.borderColor = [UIColor greenColor].CGColor;
-    self.menuView.layer.borderWidth = 1;
-    self.menuView.hidden = YES;
-    [self addSubview:self.menuView];
+    // 2. Main Panel (Blur Effect)
+    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
+    self.blurPanel = [[UIVisualEffectView alloc] initWithEffect:blur];
+    self.blurPanel.frame = CGRectMake(20, 160, self.frame.size.width - 40, 450);
+    self.blurPanel.layer.cornerRadius = 18;
+    self.blurPanel.layer.borderWidth = 1;
+    self.blurPanel.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:1.0].CGColor;
+    self.blurPanel.clipsToBounds = YES;
+    self.blurPanel.hidden = YES;
+    [self addSubview:self.blurPanel];
 
-    // 3. Search / Input Field
-    self.inputField = [[UITextField alloc] initWithFrame:CGRectMake(15, 15, self.menuView.frame.size.width - 110, 35)];
-    self.inputField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
-    self.inputField.textColor = [UIColor greenColor];
-    self.inputField.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightBold];
-    self.inputField.placeholder = @"Search Classes...";
-    self.inputField.layer.cornerRadius = 8;
-    self.inputField.delegate = self;
-    [self.inputField addTarget:self action:@selector(textFieldDidChange:) forControlEvents:UIControlEventEditingChanged];
-    [self.menuView addSubview:self.inputField];
+    self.contentView = self.blurPanel.contentView;
 
-    // 4. Mode Toggle (BROWSE / DUMP)
-    self.modeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.modeBtn.frame = CGRectMake(self.menuView.frame.size.width - 85, 15, 70, 35);
-    self.modeBtn.backgroundColor = [UIColor greenColor];
-    self.modeBtn.layer.cornerRadius = 8;
-    [self.modeBtn setTitle:@"LIST" forState:UIControlStateNormal]; // Starts in Browser mode
-    [self.modeBtn setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
-    [self.modeBtn addTarget:self action:@selector(toggleMode) forControlEvents:UIControlEventTouchUpInside];
-    [self.menuView addSubview:self.modeBtn];
+    // 3. Tab Bar
+    self.tabs = [[UISegmentedControl alloc] initWithItems:@[@"Identity", @"Inspector", @"Terminal"]];
+    self.tabs.frame = CGRectMake(15, 15, self.contentView.frame.size.width - 30, 35);
+    self.tabs.selectedSegmentIndex = 0;
+    self.tabs.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.5];
+    self.tabs.selectedSegmentTintColor = THEME_COLOR;
+    [self.tabs setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor blackColor]} forState:UIControlStateSelected];
+    [self.tabs setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]} forState:UIControlStateNormal];
+    [self.tabs addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
+    [self.contentView addSubview:self.tabs];
 
-    // 5. CLASS BROWSER (TableView)
-    self.classTableView = [[UITableView alloc] initWithFrame:CGRectMake(15, 60, self.menuView.frame.size.width - 30, 425)];
-    self.classTableView.backgroundColor = [UIColor clearColor];
-    self.classTableView.separatorColor = [UIColor darkGrayColor];
-    self.classTableView.delegate = self;
-    self.classTableView.dataSource = self;
-    self.classTableView.hidden = NO; // Show list by default
-    [self.menuView addSubview:self.classTableView];
+    // 4. Views
+    [self setupIdentityView];
+    [self setupInspectorView];
+    [self setupTerminalView];
+    
+    // 5. Toast Label (Hidden)
+    self.toastLabel = [[UILabel alloc] initWithFrame:CGRectMake(40, self.blurPanel.frame.size.height - 50, self.blurPanel.frame.size.width - 80, 30)];
+    self.toastLabel.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
+    self.toastLabel.textColor = [UIColor whiteColor];
+    self.toastLabel.textAlignment = NSTextAlignmentCenter;
+    self.toastLabel.font = [UIFont boldSystemFontOfSize:12];
+    self.toastLabel.layer.cornerRadius = 15;
+    self.toastLabel.clipsToBounds = YES;
+    self.toastLabel.alpha = 0;
+    [self.contentView addSubview:self.toastLabel];
+}
 
-    // 6. TERMINAL OUTPUT (Hidden initially)
-    self.terminalView = [[UITextView alloc] initWithFrame:CGRectMake(15, 60, self.menuView.frame.size.width - 30, 425)];
-    self.terminalView.backgroundColor = [UIColor blackColor];
-    self.terminalView.textColor = [UIColor greenColor];
-    self.terminalView.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
-    self.terminalView.editable = NO;
+// --- TAB 1: IDENTITY ---
+- (void)setupIdentityView {
+    self.identityView = [[UIView alloc] initWithFrame:CGRectMake(0, 60, self.contentView.frame.size.width, 390)];
+    [self.contentView addSubview:self.identityView];
+
+    UILabel *header = [[UILabel alloc] initWithFrame:CGRectMake(0, 10, self.identityView.frame.size.width, 30)];
+    header.text = @"DEVICE SPOOFER";
+    header.textAlignment = NSTextAlignmentCenter;
+    header.textColor = [UIColor whiteColor];
+    header.font = [UIFont systemFontOfSize:14 weight:UIFontWeightHeavy];
+    [self.identityView addSubview:header];
+
+    self.idInfoLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, self.identityView.frame.size.width - 40, 100)];
+    self.idInfoLabel.numberOfLines = 5;
+    self.idInfoLabel.textColor = [UIColor lightGrayColor];
+    self.idInfoLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    [self updateIdLabels];
+    [self.identityView addSubview:self.idInfoLabel];
+
+    UIButton *btnReset = [self createBtn:@"Rotate Identity & Restart" color:[UIColor systemRedColor] y:180];
+    [btnReset addTarget:self action:@selector(doReset) forControlEvents:UIControlEventTouchUpInside];
+    [self.identityView addSubview:btnReset];
+}
+
+// --- TAB 2: INSPECTOR ---
+- (void)setupInspectorView {
+    self.inspectorView = [[UIView alloc] initWithFrame:self.identityView.frame];
+    self.inspectorView.hidden = YES;
+    [self.contentView addSubview:self.inspectorView];
+
+    self.searchField = [[UITextField alloc] initWithFrame:CGRectMake(15, 0, self.inspectorView.frame.size.width - 30, 35)];
+    self.searchField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    self.searchField.textColor = [UIColor whiteColor];
+    self.searchField.layer.cornerRadius = 8;
+    self.searchField.placeholder = @" Search Classes...";
+    self.searchField.delegate = self;
+    [self.searchField addTarget:self action:@selector(searchChanged:) forControlEvents:UIControlEventEditingChanged];
+    [self.inspectorView addSubview:self.searchField];
+
+    self.classTable = [[UITableView alloc] initWithFrame:CGRectMake(0, 45, self.inspectorView.frame.size.width, 345)];
+    self.classTable.backgroundColor = [UIColor clearColor];
+    self.classTable.separatorStyle = UITableViewCellSeparatorStyleNone;
+    self.classTable.delegate = self;
+    self.classTable.dataSource = self;
+    [self.inspectorView addSubview:self.classTable];
+}
+
+// --- TAB 3: TERMINAL ---
+- (void)setupTerminalView {
+    self.terminalView = [[UIView alloc] initWithFrame:self.identityView.frame];
     self.terminalView.hidden = YES;
-    [self.menuView addSubview:self.terminalView];
+    [self.contentView addSubview:self.terminalView];
+
+    self.netToggleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.netToggleBtn.frame = CGRectMake(15, 0, self.terminalView.frame.size.width - 30, 35);
+    self.netToggleBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    self.netToggleBtn.layer.cornerRadius = 8;
+    [self.netToggleBtn setTitle:@"Network Monitor: OFF" forState:UIControlStateNormal];
+    [self.netToggleBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [self.netToggleBtn addTarget:self action:@selector(toggleNet) forControlEvents:UIControlEventTouchUpInside];
+    [self.terminalView addSubview:self.netToggleBtn];
+
+    self.consoleView = [[UITextView alloc] initWithFrame:CGRectMake(15, 45, self.terminalView.frame.size.width - 30, 335)];
+    self.consoleView.backgroundColor = [UIColor blackColor];
+    self.consoleView.textColor = THEME_COLOR;
+    self.consoleView.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    self.consoleView.editable = NO;
+    self.consoleView.layer.cornerRadius = 8;
+    self.consoleView.text = @"[Enigma Shell] Ready...\n";
+    [self.terminalView addSubview:self.consoleView];
+}
+
+// --- LOGIC ---
+- (UIButton *)createBtn:(NSString *)t color:(UIColor *)c y:(CGFloat)y {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(20, y, self.identityView.frame.size.width - 40, 45);
+    b.backgroundColor = c;
+    b.layer.cornerRadius = 10;
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    return b;
 }
 
 - (void)toggleMenu {
-    self.menuView.hidden = !self.menuView.hidden;
-    if (self.menuView.hidden) [self.inputField resignFirstResponder];
+    self.blurPanel.hidden = !self.blurPanel.hidden;
+    if (self.blurPanel.hidden) [self.searchField resignFirstResponder];
 }
 
-// Switch between List View and Terminal View
-- (void)toggleMode {
-    if (self.classTableView.hidden) {
-        // Switch to List
-        self.classTableView.hidden = NO;
-        self.terminalView.hidden = YES;
-        [self.modeBtn setTitle:@"LIST" forState:UIControlStateNormal];
-        self.inputField.placeholder = @"Search Classes...";
+- (void)tabChanged {
+    self.identityView.hidden = (self.tabs.selectedSegmentIndex != 0);
+    self.inspectorView.hidden = (self.tabs.selectedSegmentIndex != 1);
+    self.terminalView.hidden = (self.tabs.selectedSegmentIndex != 2);
+    [self.searchField resignFirstResponder];
+}
+
+- (void)updateIdLabels {
+    self.idInfoLabel.text = [NSString stringWithFormat:@"UUID: ...%@\nUDID: ...%@\nModel: %s\nStatus: Spoofed (Persistent)",
+        [fakeUUID substringFromIndex:MAX(0, (int)fakeUUID.length-12)],
+        [fakeUDID substringFromIndex:MAX(0, (int)fakeUDID.length-12)],
+        fakeModel];
+}
+
+- (void)doReset {
+    fakeUUID = [[NSUUID UUID] UUIDString];
+    NSString *pool = @"abcdef0123456789";
+    NSMutableString *s = [NSMutableString stringWithCapacity:40];
+    for (int i=0; i<40; i++) [s appendFormat:@"%C", [pool characterAtIndex:arc4random_uniform(16)]];
+    fakeUDID = s;
+    savePrefs();
+    exit(0); // Crash to apply
+}
+
+- (void)showToast:(NSString *)msg {
+    self.toastLabel.text = msg;
+    [UIView animateWithDuration:0.3 animations:^{ self.toastLabel.alpha = 1; } completion:^(BOOL f){
+        [UIView animateWithDuration:0.3 delay:1.5 options:0 animations:^{ self.toastLabel.alpha = 0; } completion:nil];
+    }];
+}
+
+// --- INSPECTOR LOGIC ---
+- (void)searchChanged:(UITextField *)tf {
+    if (tf.text.length == 0) {
+        self.filteredClasses = [NSMutableArray arrayWithArray:self.allClasses];
     } else {
-        // Switch to Terminal
-        self.classTableView.hidden = YES;
-        self.terminalView.hidden = NO;
-        [self.modeBtn setTitle:@"LOGS" forState:UIControlStateNormal];
+        NSPredicate *p = [NSPredicate predicateWithFormat:@"SELF contains[c] %@", tf.text];
+        self.filteredClasses = [NSMutableArray arrayWithArray:[self.allClasses filteredArrayUsingPredicate:p]];
     }
+    [self.classTable reloadData];
 }
 
-// --- SEARCH LOGIC ---
-- (void)textFieldDidChange:(UITextField *)textField {
-    if (!self.classTableView.hidden) {
-        // Filter the list based on typing
-        NSString *query = textField.text;
-        if (query.length == 0) {
-            self.filteredClasses = [NSMutableArray arrayWithArray:self.appClasses];
-        } else {
-            NSPredicate *p = [NSPredicate predicateWithFormat:@"SELF contains[c] %@", query];
-            self.filteredClasses = [NSMutableArray arrayWithArray:[self.appClasses filteredArrayUsingPredicate:p]];
-        }
-        [self.classTableView reloadData];
-    }
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return self.filteredClasses.count; }
+- (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)p {
+    UITableViewCell *c = [t dequeueReusableCellWithIdentifier:@"c"];
+    if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"c"];
+    c.backgroundColor = [UIColor clearColor];
+    c.textLabel.textColor = [UIColor whiteColor];
+    c.textLabel.font = [UIFont fontWithName:@"Courier" size:12];
+    c.textLabel.text = self.filteredClasses[p.row];
+    return c;
+}
+- (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)p {
+    NSString *cls = self.filteredClasses[p.row];
+    [self dumpClass:cls];
+    self.tabs.selectedSegmentIndex = 2; // Jump to terminal
+    [self tabChanged];
 }
 
-// --- TABLEVIEW DELEGATES ( The Browser ) ---
-
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.filteredClasses.count;
+// --- TERMINAL LOGIC ---
+- (void)log:(NSString *)txt {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.consoleView.text = [self.consoleView.text stringByAppendingFormat:@"%@\n", txt];
+        [self.consoleView scrollRangeToVisible:NSMakeRange(self.consoleView.text.length - 1, 1)];
+    });
 }
+- (void)handleLog:(NSNotification *)n { [self log:n.object]; }
 
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *cellId = @"ClassCell";
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellId];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:cellId];
-        cell.backgroundColor = [UIColor clearColor];
-        cell.textLabel.textColor = [UIColor whiteColor];
-        cell.textLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    }
-    cell.textLabel.text = self.filteredClasses[indexPath.row];
-    return cell;
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    // User tapped a class!
-    NSString *selectedClass = self.filteredClasses[indexPath.row];
+- (void)dumpClass:(NSString *)name {
+    [self log:[NSString stringWithFormat:@"\n[*] DUMPING: %@", name]];
+    Class c = objc_getClass([name UTF8String]);
+    if (!c) { [self log:@"[!] Class not found"]; return; }
     
-    // 1. Update UI
-    self.inputField.text = selectedClass;
-    [self.inputField resignFirstResponder];
-    
-    // 2. Switch to Terminal Mode
-    self.classTableView.hidden = YES;
-    self.terminalView.hidden = NO;
-    [self.modeBtn setTitle:@"LOGS" forState:UIControlStateNormal];
-    
-    // 3. Run the Dump
-    [self runDumpForClass:selectedClass];
+    unsigned int count;
+    Method *m = class_copyMethodList(c, &count);
+    for (int i=0; i<count; i++) {
+        [self log:[NSString stringWithFormat:@" - %@", NSStringFromSelector(method_getName(m[i]))]];
+    }
+    free(m);
+    [self log:@"[✓] Done."];
 }
 
-// --- DUMPER LOGIC ---
-- (void)runDumpForClass:(NSString *)className {
-    self.terminalView.text = @""; // Clear old logs
-    [self logToTerminal:[NSString stringWithFormat:@"[*] Dumping: %@\n-------------------", className]];
-
-    Class targetClass = objc_getClass([className UTF8String]);
-    if (!targetClass) {
-        [self logToTerminal:@"[!] Error: Class not loaded."];
-        return;
+- (void)toggleNet {
+    isNetMonEnabled = !isNetMonEnabled;
+    if (isNetMonEnabled) {
+        [NSURLProtocol registerClass:[EnigmaNetLogger class]];
+        [self.netToggleBtn setTitle:@"Network Monitor: ON" forState:UIControlStateNormal];
+        [self.netToggleBtn setTitleColor:THEME_COLOR forState:UIControlStateNormal];
+        [self log:@"[*] Network Monitor Started"];
+    } else {
+        [NSURLProtocol unregisterClass:[EnigmaNetLogger class]];
+        [self.netToggleBtn setTitle:@"Network Monitor: OFF" forState:UIControlStateNormal];
+        [self.netToggleBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     }
-
-    unsigned int methodCount = 0;
-    Method *methods = class_copyMethodList(targetClass, &methodCount);
-
-    for (unsigned int i = 0; i < methodCount; i++) {
-        Method method = methods[i];
-        NSString *methodName = NSStringFromSelector(method_getName(method));
-        [self logToTerminal:[NSString stringWithFormat:@"- %@", methodName]];
-    }
-    
-    // Also dump properties if you want
-    [self logToTerminal:@"\n[Properties]"];
-    unsigned int propCount = 0;
-    objc_property_t *props = class_copyPropertyList(targetClass, &propCount);
-    for (unsigned int i = 0; i < propCount; i++) {
-        const char *name = property_getName(props[i]);
-        [self logToTerminal:[NSString stringWithFormat:@". %s", name]];
-    }
-
-    free(methods);
-    free(props);
-    [self logToTerminal:@"\n[✓] END OF DUMP"];
-}
-
-- (void)logToTerminal:(NSString *)text {
-    self.terminalView.text = [self.terminalView.text stringByAppendingFormat:@"%@\n", text];
-    if(self.terminalView.text.length > 0) {
-        [self.terminalView scrollRangeToVisible:NSMakeRange(self.terminalView.text.length - 1, 1)];
-    }
-}
-
-- (BOOL)textFieldShouldReturn:(UITextField *)textField {
-    [textField resignFirstResponder];
-    return YES;
 }
 @end
 
+// --- HOOKS ---
+
+%hook UIDevice
+- (NSUUID *)identifierForVendor { return [[NSUUID alloc] initWithUUIDString:fakeUUID]; }
+%end
+
+static CFPropertyListRef (*old_MGCopyAnswer)(CFStringRef);
+CFPropertyListRef new_MGCopyAnswer(CFStringRef p) {
+    if (CFStringCompare(p, CFSTR("UniqueDeviceID"), 0) == 0) return (__bridge CFPropertyListRef)fakeUDID;
+    return old_MGCopyAnswer(p);
+}
+
+static int (*old_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
+int new_sysctlbyname(const char *n, void *o, size_t *ol, void *np, size_t nl) {
+    if (strcmp(n, "hw.machine") == 0 && o) {
+        size_t l = strlen(fakeModel) + 1;
+        if (*ol >= l) { memcpy(o, fakeModel, l); *ol = l; }
+        return 0;
+    }
+    return old_sysctlbyname(n, o, ol, np, nl);
+}
+
 %ctor {
-    // 5-second safe delay before injecting UI
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *w = nil;
-        for (UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) {
-            if (s.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *win in s.windows) if (win.isKeyWindow) { w = win; break; }
+    loadPrefs();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            UIWindow *w = [UIApplication sharedApplication].keyWindow;
+            if (!w) {
+                for (UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) {
+                    if (s.activationState == UISceneActivationStateForegroundActive) {
+                        for (UIWindow *win in s.windows) if (win.isKeyWindow) { w = win; break; }
+                    }
+                }
             }
-        }
-        if (!w) w = [UIApplication sharedApplication].keyWindow;
-        if (w) [w addSubview:[[EnigmaOverlay alloc] initWithFrame:w.bounds]];
+            if (w) [w addSubview:[[EnigmaMenu alloc] initWithFrame:w.bounds]];
+            
+            void *mg = dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+            if (mg) MSHookFunction(mg, (void *)new_MGCopyAnswer, (void **)&old_MGCopyAnswer);
+            
+            void *sc = dlsym(RTLD_DEFAULT, "sysctlbyname");
+            if (sc) MSHookFunction(sc, (void *)new_sysctlbyname, (void **)&old_sysctlbyname);
+        } @catch (NSException *e) {}
     });
     %init;
 }
