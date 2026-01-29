@@ -13,7 +13,7 @@
 // --- GLOBAL STATE ---
 static NSString *fakeUUID = nil;
 static NSString *fakeUDID = nil;
-static char *fakeModel = "iPhone18,1"; // iOS 26.2 Standard
+static char *fakeModel = "iPhone18,1";
 static BOOL isNetMonEnabled = NO;
 
 // --- PERSISTENCE ---
@@ -38,7 +38,7 @@ void savePrefs() {
 + (BOOL)canInitWithRequest:(NSURLRequest *)r {
     if (!isNetMonEnabled) return NO;
     if ([NSURLProtocol propertyForKey:@"EnigmaHandled" inRequest:r]) return NO;
-    if (![r.URL.scheme hasPrefix:@"http"]) return NO;
+    // Removing scheme check to catch EVERYTHING (WebSocket, etc)
     return YES;
 }
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
@@ -46,8 +46,7 @@ void savePrefs() {
     NSMutableURLRequest *newReq = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:@"EnigmaHandled" inRequest:newReq];
     
-    // Log to UI
-    NSString *log = [NSString stringWithFormat:@"[%@] %@", newReq.HTTPMethod, newReq.URL.absoluteString];
+    NSString *log = [NSString stringWithFormat:@"[%@] %@", newReq.HTTPMethod ?: @"GET", newReq.URL.absoluteString];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"EnigmaLog" object:log];
     
     NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
@@ -63,38 +62,31 @@ void savePrefs() {
 - (void)stopLoading {}
 @end
 
-// --- MAIN UI CLASS ---
+// --- MAIN UI CLASS (Unchanged Logic, Restoring UI) ---
 @interface EnigmaMenu : UIView <UITableViewDelegate, UITableViewDataSource, UITextFieldDelegate>
-// Core UI
 @property (nonatomic, strong) UIButton *floatBtn;
 @property (nonatomic, strong) UIVisualEffectView *blurPanel;
 @property (nonatomic, strong) UIView *contentView;
 @property (nonatomic, strong) UISegmentedControl *tabs;
-
-// Tab 1: Identity
 @property (nonatomic, strong) UIView *identityView;
 @property (nonatomic, strong) UILabel *idInfoLabel;
-
-// Tab 2: Inspector
 @property (nonatomic, strong) UIView *inspectorView;
 @property (nonatomic, strong) UITextField *searchField;
 @property (nonatomic, strong) UITableView *classTable;
 @property (nonatomic, strong) NSMutableArray *allClasses;
 @property (nonatomic, strong) NSMutableArray *filteredClasses;
-
-// Tab 3: Terminal
 @property (nonatomic, strong) UIView *terminalView;
 @property (nonatomic, strong) UITextView *consoleView;
 @property (nonatomic, strong) UIButton *netToggleBtn;
 @end
 
 @implementation EnigmaMenu
-
+// ... (Standard Init & UI Setup) ...
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.userInteractionEnabled = YES; // Allow touches
-        self.backgroundColor = [UIColor clearColor]; // Make background invisible
+        self.userInteractionEnabled = YES;
+        self.backgroundColor = [UIColor clearColor];
         [self loadClasses];
         [self setupUI];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleLog:) name:@"EnigmaLog" object:nil];
@@ -102,15 +94,9 @@ void savePrefs() {
     return self;
 }
 
-// --- CRITICAL FIX: ALLOW TOUCHES THROUGH ---
-// This method allows you to click Instagram buttons when the menu is closed
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
-    
-    // If the touch hit "self" (the empty full-screen view), return nil so it passes to Instagram
     if (hitView == self) return nil;
-    
-    // Otherwise, it hit a button or the menu panel, so we keep the touch
     return hitView;
 }
 
@@ -128,7 +114,6 @@ void savePrefs() {
 }
 
 - (void)setupUI {
-    // 1. Floating Button
     self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatBtn.frame = CGRectMake(self.frame.size.width - 70, 100, 50, 50);
     self.floatBtn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
@@ -140,7 +125,6 @@ void savePrefs() {
     [self.floatBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.floatBtn];
 
-    // 2. Main Panel
     UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
     self.blurPanel = [[UIVisualEffectView alloc] initWithEffect:blur];
     self.blurPanel.frame = CGRectMake(20, 160, self.frame.size.width - 40, 450);
@@ -150,10 +134,8 @@ void savePrefs() {
     self.blurPanel.clipsToBounds = YES;
     self.blurPanel.hidden = YES;
     [self addSubview:self.blurPanel];
-
     self.contentView = self.blurPanel.contentView;
 
-    // 3. Tabs
     self.tabs = [[UISegmentedControl alloc] initWithItems:@[@"Identity", @"Inspector", @"Terminal"]];
     self.tabs.frame = CGRectMake(15, 15, self.contentView.frame.size.width - 30, 35);
     self.tabs.selectedSegmentIndex = 0;
@@ -164,24 +146,20 @@ void savePrefs() {
     [self.tabs addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
     [self.contentView addSubview:self.tabs];
 
-    // 4. Setup Views
     [self setupIdentityView];
     [self setupInspectorView];
     [self setupTerminalView];
 }
 
-// --- TAB 1: IDENTITY SETUP ---
 - (void)setupIdentityView {
     self.identityView = [[UIView alloc] initWithFrame:CGRectMake(0, 60, self.contentView.frame.size.width, 390)];
     [self.contentView addSubview:self.identityView];
-
     self.idInfoLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 20, self.identityView.frame.size.width - 40, 100)];
     self.idInfoLabel.numberOfLines = 5;
     self.idInfoLabel.textColor = [UIColor lightGrayColor];
     self.idInfoLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     [self updateIdLabels];
     [self.identityView addSubview:self.idInfoLabel];
-
     UIButton *btnReset = [UIButton buttonWithType:UIButtonTypeSystem];
     btnReset.frame = CGRectMake(20, 140, self.identityView.frame.size.width - 40, 45);
     btnReset.backgroundColor = [UIColor systemRedColor];
@@ -192,12 +170,10 @@ void savePrefs() {
     [self.identityView addSubview:btnReset];
 }
 
-// --- TAB 2: INSPECTOR SETUP ---
 - (void)setupInspectorView {
     self.inspectorView = [[UIView alloc] initWithFrame:self.identityView.frame];
     self.inspectorView.hidden = YES;
     [self.contentView addSubview:self.inspectorView];
-
     self.searchField = [[UITextField alloc] initWithFrame:CGRectMake(15, 0, self.inspectorView.frame.size.width - 30, 35)];
     self.searchField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
     self.searchField.textColor = [UIColor whiteColor];
@@ -206,7 +182,6 @@ void savePrefs() {
     self.searchField.delegate = self;
     [self.searchField addTarget:self action:@selector(searchChanged:) forControlEvents:UIControlEventEditingChanged];
     [self.inspectorView addSubview:self.searchField];
-
     self.classTable = [[UITableView alloc] initWithFrame:CGRectMake(0, 45, self.inspectorView.frame.size.width, 345)];
     self.classTable.backgroundColor = [UIColor clearColor];
     self.classTable.delegate = self;
@@ -214,12 +189,10 @@ void savePrefs() {
     [self.inspectorView addSubview:self.classTable];
 }
 
-// --- TAB 3: TERMINAL SETUP ---
 - (void)setupTerminalView {
     self.terminalView = [[UIView alloc] initWithFrame:self.identityView.frame];
     self.terminalView.hidden = YES;
     [self.contentView addSubview:self.terminalView];
-
     self.netToggleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     self.netToggleBtn.frame = CGRectMake(15, 0, self.terminalView.frame.size.width - 30, 35);
     self.netToggleBtn.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
@@ -228,7 +201,6 @@ void savePrefs() {
     [self.netToggleBtn setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
     [self.netToggleBtn addTarget:self action:@selector(toggleNet) forControlEvents:UIControlEventTouchUpInside];
     [self.terminalView addSubview:self.netToggleBtn];
-
     self.consoleView = [[UITextView alloc] initWithFrame:CGRectMake(15, 45, self.terminalView.frame.size.width - 30, 335)];
     self.consoleView.backgroundColor = [UIColor blackColor];
     self.consoleView.textColor = THEME_COLOR;
@@ -238,26 +210,22 @@ void savePrefs() {
     [self.terminalView addSubview:self.consoleView];
 }
 
-// --- UI LOGIC ---
 - (void)toggleMenu {
     self.blurPanel.hidden = !self.blurPanel.hidden;
     if (self.blurPanel.hidden) [self.searchField resignFirstResponder];
 }
-
 - (void)tabChanged {
     self.identityView.hidden = (self.tabs.selectedSegmentIndex != 0);
     self.inspectorView.hidden = (self.tabs.selectedSegmentIndex != 1);
     self.terminalView.hidden = (self.tabs.selectedSegmentIndex != 2);
     [self.searchField resignFirstResponder];
 }
-
 - (void)updateIdLabels {
     self.idInfoLabel.text = [NSString stringWithFormat:@"UUID: ...%@\nUDID: ...%@\nModel: %s\nStatus: Active",
         [fakeUUID substringFromIndex:MAX(0, (int)fakeUUID.length-12)],
         [fakeUDID substringFromIndex:MAX(0, (int)fakeUDID.length-12)],
         fakeModel];
 }
-
 - (void)doReset {
     fakeUUID = [[NSUUID UUID] UUIDString];
     NSString *pool = @"abcdef0123456789";
@@ -267,12 +235,9 @@ void savePrefs() {
     savePrefs();
     exit(0);
 }
-
-// --- INSPECTOR LOGIC ---
 - (void)searchChanged:(UITextField *)tf {
-    if (tf.text.length == 0) {
-        self.filteredClasses = [NSMutableArray arrayWithArray:self.allClasses];
-    } else {
+    if (tf.text.length == 0) self.filteredClasses = [NSMutableArray arrayWithArray:self.allClasses];
+    else {
         NSPredicate *p = [NSPredicate predicateWithFormat:@"SELF contains[c] %@", tf.text];
         self.filteredClasses = [NSMutableArray arrayWithArray:[self.allClasses filteredArrayUsingPredicate:p]];
     }
@@ -290,11 +255,9 @@ void savePrefs() {
 }
 - (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)p {
     [self dumpClass:self.filteredClasses[p.row]];
-    self.tabs.selectedSegmentIndex = 2; // Jump to terminal
+    self.tabs.selectedSegmentIndex = 2;
     [self tabChanged];
 }
-
-// --- TERMINAL LOGIC ---
 - (void)log:(NSString *)txt {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.consoleView.text = [self.consoleView.text stringByAppendingFormat:@"%@\n", txt];
@@ -302,49 +265,72 @@ void savePrefs() {
     });
 }
 - (void)handleLog:(NSNotification *)n { [self log:n.object]; }
-
 - (void)dumpClass:(NSString *)name {
     [self log:[NSString stringWithFormat:@"\n[*] DUMPING: %@", name]];
     Class c = objc_getClass([name UTF8String]);
     if (!c) { [self log:@"[!] Class not found"]; return; }
     unsigned int count;
     Method *m = class_copyMethodList(c, &count);
-    for (int i=0; i<count; i++) {
-        [self log:[NSString stringWithFormat:@" - %@", NSStringFromSelector(method_getName(m[i]))]];
-    }
+    for (int i=0; i<count; i++) [self log:[NSString stringWithFormat:@" - %@", NSStringFromSelector(method_getName(m[i]))]];
     free(m);
 }
-
 - (void)toggleNet {
     isNetMonEnabled = !isNetMonEnabled;
     if (isNetMonEnabled) {
         [self.netToggleBtn setTitle:@"STOP MONITOR" forState:UIControlStateNormal];
         [self.netToggleBtn setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
-        [self log:@"[*] Monitor STARTED."];
+        [self log:@"[*] AGGRESSIVE Monitor ENABLED."];
     } else {
         [self.netToggleBtn setTitle:@"START NETWORK MONITOR" forState:UIControlStateNormal];
         [self.netToggleBtn setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
-        [self log:@"[*] Monitor STOPPED."];
+        [self log:@"[*] Monitor PAUSED."];
     }
 }
 @end
 
-// --- HOOKS ---
+// --- THE NUCLEAR OPTION: HOOK SESSION CONSTRUCTOR ---
+// This overrides the creation of EVERY network session in the app
+%hook NSURLSession
 
-// Aggressive Network Hook
-%hook NSURLSessionConfiguration
-- (NSArray *)protocolClasses {
-    NSArray *orig = %orig;
-    if (![orig containsObject:[EnigmaNetLogger class]]) {
-        NSMutableArray *new = [NSMutableArray arrayWithObject:[EnigmaNetLogger class]];
-        [new addObjectsFromArray:orig];
-        return new;
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration
+                                  delegate:(id<NSURLSessionDelegate>)delegate
+                             delegateQueue:(NSOperationQueue *)queue {
+    
+    // 1. Force HTTP/1.1 (Disables QUIC/HTTP3)
+    // This forces traffic into a protocol we can actually sniff
+    if (configuration) {
+        configuration.HTTPShouldUsePipelining = YES;
+        // configuration.TLSMinimumSupportedProtocol = kTLSProtocol12; // Optional
     }
-    return orig;
+
+    // 2. Inject our Logger Class into the protocol list
+    if (configuration) {
+        NSMutableArray *protocols = [NSMutableArray arrayWithArray:configuration.protocolClasses];
+        if (![protocols containsObject:[EnigmaNetLogger class]]) {
+            [protocols insertObject:[EnigmaNetLogger class] atIndex:0];
+            configuration.protocolClasses = protocols;
+        }
+    }
+    
+    // 3. Pass modified config to the original system
+    return %orig(configuration, delegate, queue);
 }
+
+// Also hook the simpler convenience initializer just in case
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration {
+    if (configuration) {
+        NSMutableArray *protocols = [NSMutableArray arrayWithArray:configuration.protocolClasses];
+        if (![protocols containsObject:[EnigmaNetLogger class]]) {
+            [protocols insertObject:[EnigmaNetLogger class] atIndex:0];
+            configuration.protocolClasses = protocols;
+        }
+    }
+    return %orig(configuration);
+}
+
 %end
 
-// Identity Hooks
+// --- SPOOFING HOOKS ---
 %hook UIDevice
 - (NSUUID *)identifierForVendor { return [[NSUUID alloc] initWithUUIDString:fakeUUID]; }
 %end
@@ -354,7 +340,6 @@ CFPropertyListRef new_MGCopyAnswer(CFStringRef p) {
     if (CFStringCompare(p, CFSTR("UniqueDeviceID"), 0) == 0) return (__bridge CFPropertyListRef)fakeUDID;
     return old_MGCopyAnswer(p);
 }
-
 static int (*old_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
 int new_sysctlbyname(const char *n, void *o, size_t *ol, void *np, size_t nl) {
     if (strcmp(n, "hw.machine") == 0 && o) {
@@ -365,7 +350,6 @@ int new_sysctlbyname(const char *n, void *o, size_t *ol, void *np, size_t nl) {
     return old_sysctlbyname(n, o, ol, np, nl);
 }
 
-// --- CONSTRUCTOR ---
 %ctor {
     loadPrefs();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -382,7 +366,6 @@ int new_sysctlbyname(const char *n, void *o, size_t *ol, void *np, size_t nl) {
             
             void *mg = dlsym(RTLD_DEFAULT, "MGCopyAnswer");
             if (mg) MSHookFunction(mg, (void *)new_MGCopyAnswer, (void **)&old_MGCopyAnswer);
-            
             void *sc = dlsym(RTLD_DEFAULT, "sysctlbyname");
             if (sc) MSHookFunction(sc, (void *)new_sysctlbyname, (void **)&old_sysctlbyname);
         } @catch (NSException *e) {}
