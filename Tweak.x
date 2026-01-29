@@ -1,6 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
-#import <dlfcn.h> // Required for dlsym
+#import <dlfcn.h> // Essential for dynamic lookup
 
 // --- Identity Storage ---
 static NSString *fakeUUID = @"E621E1F8-C36C-495A-93FC-0C247A3E6E5F";
@@ -32,9 +32,9 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 }
 
 - (void)setupUI {
-    // Corner Button
+    // 1. Persistent Corner Button
     self.cornerBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.cornerBtn.frame = CGRectMake(self.frame.size.width - 65, 60, 50, 50);
+    self.cornerBtn.frame = CGRectMake(self.frame.size.width - 65, 80, 50, 50);
     self.cornerBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
     self.cornerBtn.layer.cornerRadius = 25;
     self.cornerBtn.layer.borderWidth = 1;
@@ -43,24 +43,22 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
     [self.cornerBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.cornerBtn];
 
-    // Menu View
-    self.menuView = [[UIView alloc] initWithFrame:CGRectMake(25, 120, self.frame.size.width - 50, 340)];
+    // 2. The Menu
+    self.menuView = [[UIView alloc] initWithFrame:CGRectMake(25, 140, self.frame.size.width - 50, 340)];
     self.menuView.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
     self.menuView.layer.cornerRadius = 18;
     self.menuView.layer.borderWidth = 1;
-    self.menuView.layer.borderColor = [UIColor darkGrayColor].CGColor;
+    self.menuView.layer.borderColor = [UIColor grayColor].CGColor;
     self.menuView.hidden = YES;
     [self addSubview:self.menuView];
 
-    // Header
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(0, 15, self.menuView.frame.size.width, 25)];
-    t.text = @"ENIGMA JAILED";
+    t.text = @"ENIGMA UNLOCKED";
     t.textAlignment = NSTextAlignmentCenter;
     t.textColor = [UIColor cyanColor];
     t.font = [UIFont boldSystemFontOfSize:16];
     [self.menuView addSubview:t];
 
-    // Info Label
     self.infoLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, self.menuView.frame.size.width - 40, 50)];
     self.infoLabel.numberOfLines = 2;
     self.infoLabel.textColor = [UIColor whiteColor];
@@ -119,40 +117,41 @@ static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 }
 %end
 
-// Define pointer storage for the original function
+// Pointer for original MGCopyAnswer
 static CFPropertyListRef (*old_MGCopyAnswer)(CFStringRef property);
 
-// Our custom replacement function
+// Replacement MGCopyAnswer
 CFPropertyListRef new_MGCopyAnswer(CFStringRef property) {
-    // Check if the requested property is the UniqueDeviceID
     if (property && CFStringCompare(property, CFSTR("UniqueDeviceID"), 0) == kCFCompareEqualTo) {
         return (__bridge CFPropertyListRef)fakeUDID;
     }
-    // Otherwise, pass it to the original Apple function
     return old_MGCopyAnswer(property);
 }
 
 %ctor {
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UIWindow *w = nil;
-            if (@available(iOS 13.0, *)) {
-                for (UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) {
-                    if (s.activationState == UISceneActivationStateForegroundActive) {
-                        for (UIWindow *win in s.windows) if (win.isKeyWindow) { w = win; break; }
-                    }
+    // 1. UI Initialization (Delayed to prevent launch race conditions)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *w = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene* s in [UIApplication sharedApplication].connectedScenes) {
+                if (s.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *win in s.windows) if (win.isKeyWindow) { w = win; break; }
                 }
             }
-            if (!w) w = [UIApplication sharedApplication].keyWindow;
-            if (w) [w addSubview:[[EnigmaOverlay alloc] initWithFrame:w.bounds]];
-        });
-    }];
+        }
+        if (!w) w = [UIApplication sharedApplication].keyWindow;
+        if (w) [w addSubview:[[EnigmaOverlay alloc] initWithFrame:w.bounds]];
+    });
     
-    // DYNAMIC LOOKUP: Find MGCopyAnswer at runtime to avoid linker errors
+    // 2. UDID Hooking (The "Bruh" Method)
+    // We use dlsym to grab the pointer dynamically. This avoids linking errors.
     void *mgAddress = dlsym(RTLD_DEFAULT, "MGCopyAnswer");
     
     if (mgAddress) {
+        // If your dylib works, it means MSHookFunction can handle this memory write
         MSHookFunction(mgAddress, (void *)new_MGCopyAnswer, (void **)&old_MGCopyAnswer);
+    } else {
+        NSLog(@"[Enigma] Failed to find MGCopyAnswer symbol.");
     }
     
     %init;
