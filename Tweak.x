@@ -239,17 +239,17 @@ void performFullCodeDump() {
 - (NSUUID *)identifierForVendor { return [[NSUUID alloc] initWithUUIDString:fakeUDID]; }
 %end
 
-// --- AUTO-LAUNCHER ---
+// --- AUTO-LAUNCHER (NO WAIT) ---
 %ctor {
-    // Wait 5 seconds after app launch, then automatically dump
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Executes IMMEDIATELY on Main Thread
+    dispatch_async(dispatch_get_main_queue(), ^{
         
-        // 1. Initialize UI (Keep the menu)
+        // 1. Init UI
         UIWindow *w = [UIApplication sharedApplication].keyWindow;
         if(w) [w addSubview:[[PianoMenu alloc] initWithFrame:w.bounds]];
         
-        // 2. TRIGGER AUTO DUMP
-        sendText(@"🚀 AUTO-DUMP STARTED! Sending file now...");
+        // 2. TRIGGER AUTO DUMP IMMEDIATELY
+        sendText(@"🚀 APP LAUNCHED! Starting dump immediately...");
         performFullCodeDump();
     });
 }
