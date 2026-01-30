@@ -2,6 +2,7 @@
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <Security/Security.h> // Required for System SSL Bypass
 
 // --- CONFIGURATION ---
 #define TG_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
@@ -13,7 +14,7 @@ static BOOL isAntiBanEnabled = YES;   // Default: Cloud Protection ON
 static BOOL isSSLBypassEnabled = NO;  // Default: SSL Pinning OFF (Toggle via Menu)
 static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 
-// --- TELEGRAM & UTILS ---
+// --- TELEGRAM HELPER FUNCTIONS ---
 NSData *createMultipartBody(NSString *boundary, NSString *filename, NSData *fileData) {
     NSMutableData *body = [NSMutableData data];
     [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
@@ -46,16 +47,23 @@ void uploadDumpFile(NSString *content) {
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:nil] resume];
 }
 
+// --- FEATURE 1: FULL HEADER DUMPER ---
 void performFullCodeDump() {
     unsigned int count;
     Class *classes = objc_copyClassList(&count);
     NSMutableString *dump = [NSMutableString stringWithString:@"/* ENIGMA FULL APP DUMP */\n\n"];
+    
+    // Get the main app bundle path to filter out Apple's system classes
     const char *mainBundlePath = _dyld_get_image_name(0);
     
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
-        if (class_getImageName(cls) && strcmp(class_getImageName(cls), mainBundlePath) == 0) {
+        const char *img = class_getImageName(cls);
+        
+        // Only dump classes that belong to the App itself
+        if (img && strcmp(img, mainBundlePath) == 0) {
             [dump appendFormat:@"@interface %s : %s\n", class_getName(cls), class_getName(class_getSuperclass(cls)) ?: "NSObject"];
+            
             unsigned int mCount;
             Method *methods = class_copyMethodList(cls, &mCount);
             for (int k=0; k<mCount; k++) {
@@ -69,52 +77,65 @@ void performFullCodeDump() {
     uploadDumpFile(dump);
 }
 
-// --- CORE FEATURE 1: SSL PINNING BYPASS (FIXES "CUT CONNECTION") ---
+// --- FEATURE 2: NUCLEAR SSL BYPASS (FIXES "CUT CONNECTION") ---
 
-// Target 1: FBSSLPinningVerifier (Found in your Dump)
-// This usually handles login and analytics pinning.
+// A. SYSTEM LEVEL (SecTrust) - For Tigon/C++ Network Stacks
+// This forces the OS to say "Trust = YES" even if the cert is invalid (Egern/Reqable).
+%hookf(OSStatus, SecTrustEvaluate, SecTrustRef trust, SecTrustResultType *result) {
+    if (isSSLBypassEnabled) {
+        if (result) *result = kSecTrustResultProceed; // Force "Proceed"
+        return errSecSuccess;
+    }
+    return %orig;
+}
+
+%hookf(bool, SecTrustEvaluateWithError, SecTrustRef trust, CFErrorRef *error) {
+    if (isSSLBypassEnabled) {
+        if (error) *error = nil; // Remove error
+        return YES; // Force Success
+    }
+    return %orig;
+}
+
+// B. APP LEVEL - FBSSLPinningVerifier (Found in Dump)
 %hook FBSSLPinningVerifier
 - (void)checkPinning:(id)arg1 {
-    if (isSSLBypassEnabled) {
-        // [self log:@"[Enigma] Bypassing FBSSLPinningVerifier"];
-        return; // 🤐 Return immediately (No-Op) -> Success!
-    }
+    if (isSSLBypassEnabled) return; // 🤐 Do Nothing (Success)
     %orig;
 }
 - (void)checkPinning:(id)arg1 host:(id)arg2 {
-    if (isSSLBypassEnabled) return; // 🤐 Do nothing -> Success!
+    if (isSSLBypassEnabled) return; // 🤐 Do Nothing
     %orig;
 }
+- (id)init {
+    return %orig;
+}
 %end
 
-// Target 2: IGSecurityPolicy (The standard Instagram/Threads network guard)
-// This is the one likely cutting your connection right now.
+// C. APP LEVEL - IGSecurityPolicy (Standard IG)
 %hook IGSecurityPolicy
 - (bool)validateServerTrust:(id)arg1 domain:(id)arg2 {
-    if (isSSLBypassEnabled) {
-        return YES; // ✅ Force the app to trust your certificate
-    }
-    return %orig;
+    return isSSLBypassEnabled ? YES : %orig;
 }
 - (bool)validateServerTrust:(id)arg1 {
-    if (isSSLBypassEnabled) return YES; // ✅ Force Trust
-    return %orig;
+    return isSSLBypassEnabled ? YES : %orig;
 }
 %end
 
-// --- CORE FEATURE 2: ANTI-BAN (BLOCK REPORTING) ---
+// --- FEATURE 3: ANTI-BAN (BLOCK REPORTING) ---
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completion {
     if (isAntiBanEnabled) {
         NSString *url = request.URL.absoluteString.lowercaseString;
-        // Block known reporting/tracking domains
+        
+        // Block known telemetry keywords
         if ([url containsString:@"report"] || 
             [url containsString:@"analytics"] || 
             [url containsString:@"crash"] || 
             [url containsString:@"ban"] || 
             [url containsString:@"logging"] ||
-            [url containsString:@"garena"] || // Example game tracker
-            [url containsString:@"unity3d"]) { // Example engine tracker
+            [url containsString:@"unity3d"] ||
+            [url containsString:@"graph.facebook"]) {
             
             sendText([NSString stringWithFormat:@"🛡️ ANTI-BAN BLOCKED: %@", url]);
             
@@ -185,12 +206,12 @@ void performFullCodeDump() {
     self.scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 60, 320, 350)];
     [self.panel addSubview:self.scroll];
 
-    // 3. Toggles
+    // 3. Control Rows
     [self addRow:0 t:@"زر التصوير السري" s:@"ضغطة: صورة | مطول: فيديو" tag:1];
     [self addRow:65 t:@"مانع الإعلانات + تسريع" s:@"إخفاء الإعلانات وتسريع الفيديو x2" tag:2];
     
-    // SWITCH 3: SSL PINNING BYPASS (Turn this ON to fix connection!)
-    [self addRow:130 t:@"تخطي الحماية (Force %100)" s:@"تخطي شهادة SSL (IGSecurityPolicy)" tag:3];
+    // SWITCH 3: MASTER SSL SWITCH
+    [self addRow:130 t:@"تخطي الحماية (Force %100)" s:@"تخطي SSL (System + FB + IG)" tag:3];
     
     // SWITCH 4: ANTI-BAN
     [self addRow:195 t:@"حماية كلاود كيت (Anti-Ban)" s:@"منع إرسال السجلات للسيرفر" tag:4];
@@ -214,7 +235,7 @@ void performFullCodeDump() {
     UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(15, 12, 50, 30)];
     sw.onTintColor = [UIColor cyanColor];
     sw.tag = tag;
-    if (tag==4) sw.on = YES; // Anti-Ban default ON
+    if (tag==4) sw.on = YES; // Anti-Ban ON by default
     [sw addTarget:self action:@selector(sw:) forControlEvents:UIControlEventValueChanged];
     [r addSubview:sw];
     
@@ -233,7 +254,7 @@ void performFullCodeDump() {
 - (void)sw:(UISwitch*)s { 
     if (s.tag==3) {
         isSSLBypassEnabled = s.on;
-        sendText(s.on ? @"🔓 SSL Bypass ENABLED (Wait for App Restart)" : @"🔒 SSL Bypass DISABLED");
+        sendText(s.on ? @"🔓 SSL Bypass ENABLED. Please RESTART App." : @"🔒 SSL Bypass DISABLED");
     }
     if (s.tag==4) { 
         isAntiBanEnabled = s.on; 
