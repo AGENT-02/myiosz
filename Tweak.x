@@ -9,8 +9,9 @@
 #define TG_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
 #define TG_CHAT_ID @"7730331218"
 #define TARGET_URL @"0devs.org"
+#define IGNORE_NAME @"Enigma" // YOUR DYLIB NAME TO IGNORE
 
-// --- HELPER: TELEGRAM ---
+// --- HELPER ---
 void sendText(NSString *text) {
     @try {
         NSString *urlStr = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendMessage?chat_id=%@&text=%@", 
@@ -21,88 +22,81 @@ void sendText(NSString *text) {
 }
 
 // =========================================================
-// PART 1: THE URL SWAPPER (RUNTIME HOOK)
+// PART 1: THE URL KILLER (RUNTIME REDIRECT)
 // =========================================================
-// This intercepts the URL *before* the app uses it.
-// It effectively "swaps" it in memory without breaking the file signature.
-
 %hook NSURL
-
 + (instancetype)URLWithString:(NSString *)URLString {
     if ([URLString localizedCaseInsensitiveContainsString:TARGET_URL]) {
-        // SWAP DETECTION
-        // sendText([NSString stringWithFormat:@"🚨 INTERCEPTED & SWAPPED:\n%@", URLString]);
-        
-        // Redirect to nowhere (Localhost)
-        return %orig(@"http://127.0.0.1");
+        return %orig(@"http://127.0.0.1"); // Redirect to Dead Localhost
     }
     return %orig;
 }
-
 - (instancetype)initWithString:(NSString *)URLString {
     if ([URLString localizedCaseInsensitiveContainsString:TARGET_URL]) {
         return %orig(@"http://127.0.0.1");
     }
     return %orig;
 }
-
 %end
 
 // =========================================================
-// PART 2: THE HIGH-SPEED SCANNER
+// PART 2: THE MULTI-THREADED SCANNER
 // =========================================================
-// Scans every file in the bundle for the target string.
-
-void scanBundleForTarget() {
+void fastScanBundle() {
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSFileManager *fm = [NSFileManager defaultManager];
+    
+    sendText([NSString stringWithFormat:@"🚀 HYPER-SCAN STARTED for: %@\nIgnored: %@", TARGET_URL, IGNORE_NAME]);
+
+    // 1. COLLECT FILES (Serial but fast)
+    NSMutableArray *filesToScan = [NSMutableArray array];
     NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:bundlePath];
-    
-    sendText([NSString stringWithFormat:@"🚀 FAST SCAN STARTED!\nSearching for '%@' in: %@", TARGET_URL, [bundlePath lastPathComponent]]);
-    
-    const char *target = [TARGET_URL UTF8String];
-    size_t targetLen = strlen(target);
-    
     NSString *file;
-    int scannedCount = 0;
     
     while (file = [enumerator nextObject]) {
-        scannedCount++;
-        
-        // Skip media assets to speed up (Images/Audio don't contain code)
-        if ([file hasSuffix:@".png"] || [file hasSuffix:@".jpg"] || [file hasSuffix:@".car"]) continue;
-        
-        NSString *fullPath = [bundlePath stringByAppendingPathComponent:file];
-        
-        // 1. Map file to memory (Fastest reading method)
-        int fd = open([fullPath UTF8String], O_RDONLY);
-        if (fd == -1) continue;
-        
-        struct stat sb;
-        if (fstat(fd, &sb) == -1) { close(fd); continue; }
-        
-        if (sb.st_size == 0) { close(fd); continue; }
-        
-        void *mapped = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mapped == MAP_FAILED) { close(fd); continue; }
-        
-        // 2. Search using 'memmem' (C-level byte search)
-        if (memmem(mapped, sb.st_size, target, targetLen)) {
-            // FOUND IT!
-            sendText([NSString stringWithFormat:@"🎯 FOUND TARGET URL!\n\n📂 File: %@\n📍 Path: %@", file, fullPath]);
+        // FILTER: Skip Assets & Our Dylib
+        if ([file hasSuffix:@".png"] || [file hasSuffix:@".jpg"] || 
+            [file hasSuffix:@".car"] || [file hasSuffix:@".plist"] || 
+            [file hasSuffix:@".nib"] || [file hasSuffix:@".lproj"] ||
+            [file containsString:IGNORE_NAME]) { 
+            continue; 
         }
+        [filesToScan addObject:file];
+    }
+
+    // 2. SCAN FILES (PARALLEL - Uses all Cores)
+    // dispatch_apply runs the block concurrently
+    dispatch_apply(filesToScan.count, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t i) {
         
-        // Cleanup
+        NSString *filename = filesToScan[i];
+        NSString *fullPath = [bundlePath stringByAppendingPathComponent:filename];
+        const char *target = [TARGET_URL UTF8String];
+        size_t targetLen = strlen(target);
+
+        int fd = open([fullPath UTF8String], O_RDONLY);
+        if (fd == -1) return;
+
+        struct stat sb;
+        if (fstat(fd, &sb) == -1 || sb.st_size == 0) { close(fd); return; }
+
+        // Map into memory
+        void *mapped = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mapped == MAP_FAILED) { close(fd); return; }
+
+        // FAST SEARCH
+        if (memmem(mapped, sb.st_size, target, targetLen)) {
+            sendText([NSString stringWithFormat:@"🎯 TARGET FOUND!\n\n📂 File: %@\n📍 Path: %@", filename, fullPath]);
+        }
+
         munmap(mapped, sb.st_size);
         close(fd);
-    }
+    });
     
-    sendText([NSString stringWithFormat:@"✅ SCAN COMPLETE.\nScanned %d files.", scannedCount]);
+    sendText([NSString stringWithFormat:@"✅ SCAN COMPLETE.\nProcessed %lu potential binaries.", (unsigned long)filesToScan.count]);
 }
 
 %ctor {
-    // Run scan in background immediately
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        scanBundleForTarget();
+        fastScanBundle();
     });
 }
