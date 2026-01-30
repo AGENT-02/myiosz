@@ -2,7 +2,6 @@
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
-#import <dlfcn.h>
 #import <Security/Security.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 
@@ -11,11 +10,11 @@
 #define TG_CHAT_ID @"7730331218"
 
 // --- STATE VARIABLES ---
-static BOOL isSSLBypassEnabled = NO;
-static BOOL isAntiBanEnabled = YES;
+static BOOL isSSLBypassEnabled = NO; // Controlled by Switch #3
+static BOOL isAntiBanEnabled = YES;  // Controlled by Switch #4
 static NSString *fakeUDID = nil;
 
-// --- HELPER ---
+// --- TELEGRAM HELPER ---
 void sendText(NSString *text) {
     @try {
         NSString *escapedText = [text stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
@@ -26,50 +25,69 @@ void sendText(NSString *text) {
 }
 
 // =========================================================
-// SECTION 1: C-LEVEL BORINGSSL BYPASS (REQUIRED FOR IG)
+// SECTION 1: THE "DEVELOPER MODE" BYPASS (Internal Class)
 // =========================================================
-// This hooks the C++ network stack (FBLiger) that ignores Obj-C hooks.
+// This uses the class YOU found to force the app into "Debug Mode"
+[cite_start]// where it accepts any certificate[cite: 1].
 
-int CustomVerifyCallback(int ok, void *ctx) { return 1; } // Always Success
+%hook IGNetworkSSLPinningIgnorer
 
-void (*orig_SSL_set_verify)(void *ssl, int mode, void *callback);
-void (*orig_SSL_CTX_set_verify)(void *ctx, int mode, void *callback);
-void (*orig_SSL_set_custom_verify)(void *ssl, int mode, void *callback);
-
-void hook_SSL_set_verify(void *ssl, int mode, void *callback) {
-    if (isSSLBypassEnabled) orig_SSL_set_verify(ssl, 0, (void*)CustomVerifyCallback);
-    else orig_SSL_set_verify(ssl, mode, callback);
-}
-
-void hook_SSL_CTX_set_verify(void *ctx, int mode, void *callback) {
-    if (isSSLBypassEnabled) orig_SSL_CTX_set_verify(ctx, 0, (void*)CustomVerifyCallback);
-    else orig_SSL_CTX_set_verify(ctx, mode, callback);
-}
-
-void hook_SSL_set_custom_verify(void *ssl, int mode, void *callback) {
-    if (isSSLBypassEnabled) orig_SSL_set_custom_verify(ssl, 0, (void*)CustomVerifyCallback);
-    else orig_SSL_set_custom_verify(ssl, mode, callback);
-}
-
-void HookBoringSSL() {
-    void *p1 = dlsym(RTLD_DEFAULT, "SSL_set_verify");
-    void *p2 = dlsym(RTLD_DEFAULT, "SSL_CTX_set_verify");
-    void *p3 = dlsym(RTLD_DEFAULT, "SSL_set_custom_verify");
-    if(p1) MSHookFunction(p1, (void *)hook_SSL_set_verify, (void **)&orig_SSL_set_verify);
-    if(p2) MSHookFunction(p2, (void *)hook_SSL_CTX_set_verify, (void **)&orig_SSL_CTX_set_verify);
-    if(p3) MSHookFunction(p3, (void *)hook_SSL_set_custom_verify, (void **)&orig_SSL_set_custom_verify);
-}
-
-// =========================================================
-// SECTION 2: SYSTEM LEVEL BYPASS (PROXY + TRUST)
-// =========================================================
-
-// Fix: Return EMPTY dictionary to fully hide proxy
-%hookf(CFDictionaryRef, CFNetworkCopySystemProxySettings) {
-    if (isSSLBypassEnabled) return (__bridge_retained CFDictionaryRef)@{};
+// Force the app to say "Do NOT validate certificates"
+- (BOOL)shouldValidateCertificate:(id)arg1 {
+    if (isSSLBypassEnabled) return NO;
     return %orig;
 }
 
+// The "Magic" method that accepts the proxy's certificate
+- (void)URLSession:(NSURLSession *)session didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler {
+    if (isSSLBypassEnabled) {
+        // Create a credential from the server's trust (accepting Egern/Reqable)
+        NSURLCredential *credential = [[NSURLCredential alloc] initWithTrust:challenge.protectionSpace.serverTrust];
+        if (completionHandler) {
+            completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
+        }
+        return;
+    }
+    %orig;
+}
+%end
+
+// =========================================================
+// SECTION 2: THE SECURITY POLICY OVERRIDE
+// =========================================================
+[cite_start]// We apply the same logic to the main security policy class[cite: 2].
+
+%hook IGSecurityPolicy
+
+- (BOOL)shouldValidateCertificate:(id)arg1 {
+    return isSSLBypassEnabled ? NO : %orig;
+}
+
+- (bool)validateServerTrust:(id)arg1 domain:(id)arg2 { 
+    return isSSLBypassEnabled ? YES : %orig; 
+}
+
+- (bool)validateServerTrust:(id)arg1 { 
+    return isSSLBypassEnabled ? YES : %orig; 
+}
+
+%end
+
+// =========================================================
+// SECTION 3: SYSTEM PROXY HIDER (Prevents "No Connection")
+// =========================================================
+// This makes the app think you are NOT using a proxy, preventing it
+[cite_start]// from cutting the connection when it detects Egern/Reqable[cite: 2].
+
+%hookf(CFDictionaryRef, CFNetworkCopySystemProxySettings) {
+    if (isSSLBypassEnabled) {
+        // Return Empty Dictionary = "No Proxy Configured"
+        return (__bridge_retained CFDictionaryRef)@{};
+    }
+    return %orig;
+}
+
+// Force System Trust to "Proceed"
 %hookf(OSStatus, SecTrustEvaluate, SecTrustRef trust, SecTrustResultType *result) {
     if (isSSLBypassEnabled) {
         if (result) *result = kSecTrustResultProceed;
@@ -78,37 +96,19 @@ void HookBoringSSL() {
     return %orig;
 }
 
-// Fix: Handle the Result Code check explicitly
-%hookf(OSStatus, SecTrustGetTrustResult, SecTrustRef trust, SecTrustResultType *result) {
+// The Modern Check
+%hookf(bool, SecTrustEvaluateWithError, SecTrustRef trust, CFErrorRef *error) {
     if (isSSLBypassEnabled) {
-        if (result) *result = kSecTrustResultProceed;
-        return errSecSuccess;
+        if (error) *error = nil;
+        return YES;
     }
     return %orig;
 }
 
 // =========================================================
-// SECTION 3: APP LEVEL HOOKS (YOUR DISCOVERY)
+// SECTION 4: ANTI-BAN (Telemetry Blocker)
 // =========================================================
-
-%hook IGNetworkSSLPinningIgnorer
-- (BOOL)shouldValidateCertificate:(id)cert { return isSSLBypassEnabled ? NO : %orig; }
-- (void)URLSession:(NSURLSession *)s didReceiveChallenge:(NSURLAuthenticationChallenge *)c completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completion {
-    if (isSSLBypassEnabled && completion) {
-        completion(NSURLSessionAuthChallengeUseCredential, [[NSURLCredential alloc] initWithTrust:c.protectionSpace.serverTrust]);
-    } else { %orig; }
-}
-%end
-
-%hook IGSecurityPolicy
-- (BOOL)shouldValidateCertificate:(id)cert { return isSSLBypassEnabled ? NO : %orig; }
-- (BOOL)validateServerTrust:(id)t domain:(id)d { return isSSLBypassEnabled ? YES : %orig; }
-- (BOOL)validateServerTrust:(id)t { return isSSLBypassEnabled ? YES : %orig; }
-%end
-
-// =========================================================
-// SECTION 4: ANTI-BAN (SILENT BLOCK)
-// =========================================================
+[cite_start]// Silently drops analytics requests[cite: 2].
 
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completion {
@@ -117,10 +117,9 @@ void HookBoringSSL() {
         if ([url containsString:@"report"] || [url containsString:@"analytics"] || 
             [url containsString:@"logging"] || [url containsString:@"graph.facebook"]) {
             
-            // Fix: Don't cancel. Just silence it.
+            // Silently fail the request
             if (completion) {
                 void (^handler)(NSData*, NSURLResponse*, NSError*) = completion;
-                // Return nil/error immediately to block the network call silently
                 handler(nil, nil, [NSError errorWithDomain:@"Blocked" code:403 userInfo:nil]);
             }
             return nil; 
@@ -130,14 +129,10 @@ void HookBoringSSL() {
 }
 %end
 
-%hook UIDevice
-- (NSUUID *)identifierForVendor { return fakeUDID ? [[NSUUID alloc] initWithUUIDString:fakeUDID] : %orig; }
-%end
+// =========================================================
+// SECTION 5: UI MENU (Fixed Switch Error)
+// =========================================================
 
-// =========================================================
-// SECTION 5: UI MENU
-// =========================================================
-// Kept simple to avoid UI errors.
 @interface PianoMenu : UIView
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UIButton *floatBtn;
@@ -179,7 +174,7 @@ void HookBoringSSL() {
     [self.panel addSubview:self.scroll];
 
     [self addRow:0 t:@"مانع الإعلانات" tag:2];
-    [self addRow:65 t:@"تخطي الحماية (BoringSSL)" tag:3];
+    [self addRow:65 t:@"تخطي الحماية (Developer Mode)" tag:3];
     [self addRow:130 t:@"حماية كلاود (Anti-Ban)" tag:4];
 }
 - (void)addRow:(CGFloat)y t:(NSString*)t tag:(int)tag {
@@ -199,17 +194,14 @@ void HookBoringSSL() {
 }
 - (void)toggle { self.panel.hidden = !self.panel.hidden; }
 
-// --- FIXED METHOD: BRACES ADDED TO CASE 3 ---
+// --- FIXED METHOD: Added Braces to Case 3 ---
 - (void)sw:(UISwitch*)s { 
     switch (s.tag) {
-        case 3: { // Added brace start
+        case 3: { // <--- Added Brace
             isSSLBypassEnabled = s.on;
             sendText(s.on ? @"🔓 SSL Bypass ENABLED. RESTART APP!" : @"🔒 SSL Bypass DISABLED");
-            dispatch_async(dispatch_get_main_queue(), ^{
-               // Placeholder for alert if needed
-            });
             break;
-        } // Added brace end
+        } // <--- Added Brace
         case 4:
             isAntiBanEnabled = s.on;
             break;
@@ -218,13 +210,10 @@ void HookBoringSSL() {
 @end
 
 %ctor {
-    // 1. Initialize C-Level Hooks Immediately
-    HookBoringSSL();
-
-    // 2. Initialize UDID
+    // 1. Initialize UDID
     if (!fakeUDID) fakeUDID = [[NSUUID UUID] UUIDString];
 
-    // 3. UI
+    // 2. UI
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *w = [UIApplication sharedApplication].keyWindow;
         if(w) [w addSubview:[[PianoMenu alloc] initWithFrame:w.bounds]];
