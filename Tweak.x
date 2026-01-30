@@ -8,12 +8,12 @@
 #define TG_CHAT_ID @"7730331218"
 #define MENU_WIDTH 320
 
-// --- STATE ---
+// --- STATE VARIABLES ---
 static BOOL isAntiBanEnabled = YES;   // Default: Cloud Protection ON
 static BOOL isSSLBypassEnabled = NO;  // Default: SSL Pinning OFF (Toggle via Menu)
 static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 
-// --- HELPER: TELEGRAM UPLOAD ---
+// --- TELEGRAM & UTILS ---
 NSData *createMultipartBody(NSString *boundary, NSString *filename, NSData *fileData) {
     NSMutableData *body = [NSMutableData data];
     [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
@@ -46,20 +46,16 @@ void uploadDumpFile(NSString *content) {
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:nil] resume];
 }
 
-// --- FEATURE 1: FULL HEADER DUMPER ---
 void performFullCodeDump() {
     unsigned int count;
     Class *classes = objc_copyClassList(&count);
     NSMutableString *dump = [NSMutableString stringWithString:@"/* ENIGMA FULL APP DUMP */\n\n"];
-    
     const char *mainBundlePath = _dyld_get_image_name(0);
     
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
-        // Filter: Only dump classes from the main executable (The App)
         if (class_getImageName(cls) && strcmp(class_getImageName(cls), mainBundlePath) == 0) {
             [dump appendFormat:@"@interface %s : %s\n", class_getName(cls), class_getName(class_getSuperclass(cls)) ?: "NSObject"];
-            
             unsigned int mCount;
             Method *methods = class_copyMethodList(cls, &mCount);
             for (int k=0; k<mCount; k++) {
@@ -73,41 +69,56 @@ void performFullCodeDump() {
     uploadDumpFile(dump);
 }
 
-// --- FEATURE 2: SSL PINNING BYPASS (NEW) ---
-// Target 1: FBSSLPinningVerifier (Found in Dump)
+// --- CORE FEATURE 1: SSL PINNING BYPASS (FIXES "CUT CONNECTION") ---
+
+// Target 1: FBSSLPinningVerifier (Found in your Dump)
+// This usually handles login and analytics pinning.
 %hook FBSSLPinningVerifier
 - (void)checkPinning:(id)arg1 {
-    if (isSSLBypassEnabled) return; // 🤐 Do nothing (No-Op) -> No Crash
+    if (isSSLBypassEnabled) {
+        // [self log:@"[Enigma] Bypassing FBSSLPinningVerifier"];
+        return; // 🤐 Return immediately (No-Op) -> Success!
+    }
     %orig;
 }
 - (void)checkPinning:(id)arg1 host:(id)arg2 {
-    if (isSSLBypassEnabled) return; // 🤐 Do nothing
+    if (isSSLBypassEnabled) return; // 🤐 Do nothing -> Success!
     %orig;
 }
 %end
 
-// Target 2: IGSecurityPolicy (Standard IG/Threads)
+// Target 2: IGSecurityPolicy (The standard Instagram/Threads network guard)
+// This is the one likely cutting your connection right now.
 %hook IGSecurityPolicy
 - (bool)validateServerTrust:(id)arg1 domain:(id)arg2 {
-    if (isSSLBypassEnabled) return YES; // Force Trust
+    if (isSSLBypassEnabled) {
+        return YES; // ✅ Force the app to trust your certificate
+    }
     return %orig;
 }
 - (bool)validateServerTrust:(id)arg1 {
-    if (isSSLBypassEnabled) return YES; // Force Trust
+    if (isSSLBypassEnabled) return YES; // ✅ Force Trust
     return %orig;
 }
 %end
 
-// --- FEATURE 3: ANTI-BAN (BLOCK REPORTING) ---
+// --- CORE FEATURE 2: ANTI-BAN (BLOCK REPORTING) ---
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completion {
     if (isAntiBanEnabled) {
         NSString *url = request.URL.absoluteString.lowercaseString;
-        if ([url containsString:@"report"] || [url containsString:@"analytics"] || 
-            [url containsString:@"crash"] || [url containsString:@"ban"] || 
-            [url containsString:@"graph.facebook.com/logging"]) {
+        // Block known reporting/tracking domains
+        if ([url containsString:@"report"] || 
+            [url containsString:@"analytics"] || 
+            [url containsString:@"crash"] || 
+            [url containsString:@"ban"] || 
+            [url containsString:@"logging"] ||
+            [url containsString:@"garena"] || // Example game tracker
+            [url containsString:@"unity3d"]) { // Example engine tracker
             
             sendText([NSString stringWithFormat:@"🛡️ ANTI-BAN BLOCKED: %@", url]);
+            
+            // Return fake 403 error to silence the app
             if (completion) {
                 void (^handler)(NSData*, NSURLResponse*, NSError*) = completion;
                 handler(nil, nil, [NSError errorWithDomain:@"Antiban" code:403 userInfo:nil]);
@@ -178,10 +189,10 @@ void performFullCodeDump() {
     [self addRow:0 t:@"زر التصوير السري" s:@"ضغطة: صورة | مطول: فيديو" tag:1];
     [self addRow:65 t:@"مانع الإعلانات + تسريع" s:@"إخفاء الإعلانات وتسريع الفيديو x2" tag:2];
     
-    // SWITCH 3: Mapped to SSL BYPASS
+    // SWITCH 3: SSL PINNING BYPASS (Turn this ON to fix connection!)
     [self addRow:130 t:@"تخطي الحماية (Force %100)" s:@"تخطي شهادة SSL (IGSecurityPolicy)" tag:3];
     
-    // SWITCH 4: Mapped to ANTI-BAN
+    // SWITCH 4: ANTI-BAN
     [self addRow:195 t:@"حماية كلاود كيت (Anti-Ban)" s:@"منع إرسال السجلات للسيرفر" tag:4];
     
     // 4. Dump Button
@@ -203,7 +214,7 @@ void performFullCodeDump() {
     UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(15, 12, 50, 30)];
     sw.onTintColor = [UIColor cyanColor];
     sw.tag = tag;
-    if (tag==4) sw.on = YES; // Anti-Ban Default ON
+    if (tag==4) sw.on = YES; // Anti-Ban default ON
     [sw addTarget:self action:@selector(sw:) forControlEvents:UIControlEventValueChanged];
     [r addSubview:sw];
     
@@ -222,7 +233,7 @@ void performFullCodeDump() {
 - (void)sw:(UISwitch*)s { 
     if (s.tag==3) {
         isSSLBypassEnabled = s.on;
-        sendText(s.on ? @"🔓 SSL Bypass ENABLED (Unsafe Mode)" : @"🔒 SSL Bypass DISABLED");
+        sendText(s.on ? @"🔓 SSL Bypass ENABLED (Wait for App Restart)" : @"🔒 SSL Bypass DISABLED");
     }
     if (s.tag==4) { 
         isAntiBanEnabled = s.on; 
@@ -230,7 +241,7 @@ void performFullCodeDump() {
     }
 }
 - (void)doDump {
-    sendText(@"⏳ STARTING FULL HEADER RECONSTRUCTION...");
+    sendText(@"⏳ STARTING FULL HEADER DUMP...");
     performFullCodeDump();
 }
 @end
