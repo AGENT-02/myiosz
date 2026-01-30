@@ -2,84 +2,56 @@
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
-#import <Security/Security.h> // Essential for System SSL Bypass
+#import <Security/Security.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 
 // --- CONFIGURATION ---
-// Credentials provided by you
 #define TG_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
 #define TG_CHAT_ID @"7730331218"
-#define MENU_WIDTH 320
 
 // --- STATE VARIABLES ---
-static BOOL isAntiBanEnabled = YES;   // Default: Protection ON
-static BOOL isSSLBypassEnabled = NO;  // Default: OFF (Must toggle via Menu)
+static BOOL isAntiBanEnabled = YES;
+static BOOL isSSLBypassEnabled = NO; // Controlled by Switch #3
 static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 
-// --- TELEGRAM HELPER FUNCTIONS ---
-NSData *createMultipartBody(NSString *boundary, NSString *filename, NSData *fileData) {
-    NSMutableData *body = [NSMutableData data];
-    [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"document\"; filename=\"%@\"\r\n", filename] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[@"Content-Type: text/plain\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:fileData];
-    [body appendData:[[NSString stringWithFormat:@"\r\n--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n%@", TG_CHAT_ID] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[[NSString stringWithFormat:@"\r\n--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    return body;
-}
-
+// --- TELEGRAM UTILS ---
 void sendText(NSString *text) {
     NSString *str = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendMessage?chat_id=%@&text=%@", 
                      TG_TOKEN, TG_CHAT_ID, [text stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
     [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:str] completionHandler:nil] resume];
 }
 
-void uploadDumpFile(NSString *content) {
-    NSString *filename = [NSString stringWithFormat:@"Full_Dump_%@.txt", [[NSUUID UUID] UUIDString]];
-    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:filename];
-    [content writeToFile:tempPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendDocument", TG_TOKEN]]];
-    [req setHTTPMethod:@"POST"];
-    NSString *boundary = @"Boundary-Enigma";
-    [req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
-    [req setHTTPBody:createMultipartBody(boundary, filename, [NSData dataWithContentsOfFile:tempPath])];
-    
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:nil] resume];
-}
+// --- LAYER 1: THE PROXY HIDER (Crucial for "Cut Connection") ---
+// Instagram checks if you have a Proxy set. If yes, it kills the connection.
+// We lie and say "No Proxy is running".
 
-// --- FEATURE 1: FULL HEADER DUMPER ---
-void performFullCodeDump() {
-    unsigned int count;
-    Class *classes = objc_copyClassList(&count);
-    NSMutableString *dump = [NSMutableString stringWithString:@"/* ENIGMA FULL APP DUMP */\n\n"];
-    
-    const char *mainBundlePath = _dyld_get_image_name(0);
-    
-    for (int i = 0; i < count; i++) {
-        Class cls = classes[i];
-        const char *img = class_getImageName(cls);
-        if (img && strcmp(img, mainBundlePath) == 0) {
-            [dump appendFormat:@"@interface %s : %s\n", class_getName(cls), class_getName(class_getSuperclass(cls)) ?: "NSObject"];
-            unsigned int mCount;
-            Method *methods = class_copyMethodList(cls, &mCount);
-            for (int k=0; k<mCount; k++) {
-                [dump appendFormat:@"- (void)%@;\n", NSStringFromSelector(method_getName(methods[k]))];
-            }
-            free(methods);
-            [dump appendString:@"@end\n\n"];
-        }
+%hookf(CFDictionaryRef, CFNetworkCopySystemProxySettings) {
+    if (isSSLBypassEnabled) {
+        // Return an empty dictionary (No Proxy Configured)
+        return (__bridge_retained CFDictionaryRef)@{@"HTTPEnable": @NO, @"HTTPSEnable": @NO};
     }
-    free(classes);
-    uploadDumpFile(dump);
+    return %orig;
 }
 
-// --- FEATURE 2: NUCLEAR SSL BYPASS (ALL LAYERS) ---
+// --- LAYER 2: THE "RESULT CODE" FIX (The Missing Link) ---
+// Even if we say "YES" in Evaluate, the app checks the "Result Code" separately.
+// We must force it to kSecTrustResultProceed (Safe).
 
-// 1. SYSTEM LAYER (SecTrust) - Bypasses Tigon/C++ Network Stacks
+%hookf(OSStatus, SecTrustGetTrustResult, SecTrustRef trust, SecTrustResultType *result) {
+    if (isSSLBypassEnabled) {
+        if (result) {
+            *result = kSecTrustResultProceed; // "Proceed, this is safe."
+        }
+        return errSecSuccess;
+    }
+    return %orig;
+}
+
+// --- LAYER 3: SYSTEM TRUST EVALUATION (The Standard Hook) ---
+
 %hookf(OSStatus, SecTrustEvaluate, SecTrustRef trust, SecTrustResultType *result) {
     if (isSSLBypassEnabled) {
-        if (result) *result = kSecTrustResultProceed; // Force "Proceed"
+        if (result) *result = kSecTrustResultProceed;
         return errSecSuccess;
     }
     return %orig;
@@ -87,68 +59,63 @@ void performFullCodeDump() {
 
 %hookf(bool, SecTrustEvaluateWithError, SecTrustRef trust, CFErrorRef *error) {
     if (isSSLBypassEnabled) {
-        if (error) *error = nil; // Remove error
+        if (error) *error = nil; // Delete the error
         return YES; // Force Success
     }
     return %orig;
 }
 
-// 2. SOCKET LAYER (SRSecurityPolicy) - Fixes "Cut Connection" / WebSocket drops
-%hook SRSecurityPolicy
-- (BOOL)evaluateServerTrust:(id)arg1 forDomain:(id)arg2 { 
-    return isSSLBypassEnabled ? YES : %orig; 
-}
-- (BOOL)certificateChainValidationEnabled { 
-    return isSSLBypassEnabled ? NO : %orig; 
-}
-- (void)updateSecurityOptionsInStream:(id)arg1 { 
-    if (!isSSLBypassEnabled) %orig; // Block strict updates
-}
-%end
+// --- LAYER 4: PREVENT CUSTOM ANCHORS ---
+// Prevents the app from saying "Only trust THESE 3 specific Meta certs".
+// We disable the ability to set custom anchors.
 
-// 3. META LAYER - FBSSLPinningVerifier
+%hookf(OSStatus, SecTrustSetAnchorCertificates, SecTrustRef trust, CFArrayRef anchorCertificates) {
+    if (isSSLBypassEnabled) {
+        return errSecSuccess; // Pretend we did it, but ignore the restrictive list.
+    }
+    return %orig;
+}
+
+%hookf(OSStatus, SecTrustSetAnchorCertificatesOnly, SecTrustRef trust, Boolean anchorCertificatesOnly) {
+    if (isSSLBypassEnabled) {
+        // Force it to look at System Root CAs (which includes our Sniffer Cert)
+        return %orig(trust, false); 
+    }
+    return %orig;
+}
+
+// --- LAYER 5: APP-SPECIFIC CLASSES (The High Level) ---
+
+// A. FBSSLPinningVerifier (Meta Shared)
 %hook FBSSLPinningVerifier
-- (void)checkPinning:(id)arg1 { 
-    if (isSSLBypassEnabled) return; // 🤐 Do Nothing (Success)
-    %orig;
-}
-- (void)checkPinning:(id)arg1 host:(id)arg2 { 
-    if (isSSLBypassEnabled) return; // 🤐 Do Nothing
-    %orig;
-}
+- (void)checkPinning:(id)arg1 { if (isSSLBypassEnabled) return; %orig; }
+- (void)checkPinning:(id)arg1 host:(id)arg2 { if (isSSLBypassEnabled) return; %orig; }
 - (id)init { return %orig; }
 %end
 
-// 4. IG APP LAYER - IGSecurityPolicy
+// B. IGSecurityPolicy (Instagram HTTP)
 %hook IGSecurityPolicy
-- (bool)validateServerTrust:(id)arg1 domain:(id)arg2 { 
-    return isSSLBypassEnabled ? YES : %orig; 
-}
-- (bool)validateServerTrust:(id)arg1 { 
-    return isSSLBypassEnabled ? YES : %orig; 
-}
+- (bool)validateServerTrust:(id)arg1 domain:(id)arg2 { return isSSLBypassEnabled ? YES : %orig; }
+- (bool)validateServerTrust:(id)arg1 { return isSSLBypassEnabled ? YES : %orig; }
 %end
 
-// --- FEATURE 3: ANTI-BAN (BLOCK REPORTING) ---
+// C. SRSecurityPolicy (WebSockets/Live/Chat)
+%hook SRSecurityPolicy
+- (BOOL)evaluateServerTrust:(id)arg1 forDomain:(id)arg2 { return isSSLBypassEnabled ? YES : %orig; }
+- (BOOL)certificateChainValidationEnabled { return isSSLBypassEnabled ? NO : %orig; }
+%end
+
+// --- ANTI-BAN (Telemetry Blocker) ---
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completion {
     if (isAntiBanEnabled) {
         NSString *url = request.URL.absoluteString.lowercaseString;
-        
-        // Block known telemetry keywords
-        if ([url containsString:@"report"] || 
-            [url containsString:@"analytics"] || 
-            [url containsString:@"crash"] || 
-            [url containsString:@"ban"] || 
-            [url containsString:@"logging"] ||
-            [url containsString:@"unity3d"] ||
-            [url containsString:@"graph.facebook"]) {
-            
-            sendText([NSString stringWithFormat:@"🛡️ ANTI-BAN BLOCKED: %@", url]);
+        if ([url containsString:@"report"] || [url containsString:@"analytics"] || 
+            [url containsString:@"logging"] || [url containsString:@"graph.facebook"]) {
             
             if (completion) {
                 void (^handler)(NSData*, NSURLResponse*, NSError*) = completion;
-                handler(nil, nil, [NSError errorWithDomain:@"Antiban" code:403 userInfo:nil]);
+                handler(nil, nil, [NSError errorWithDomain:@"Blocked" code:403 userInfo:nil]);
             }
             return nil;
         }
@@ -168,10 +135,7 @@ void performFullCodeDump() {
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
-    if (self) {
-        self.userInteractionEnabled = YES;
-        [self setupUI];
-    }
+    if (self) { self.userInteractionEnabled = YES; [self setupUI]; }
     return self;
 }
 
@@ -182,7 +146,6 @@ void performFullCodeDump() {
 }
 
 - (void)setupUI {
-    // Float Button
     self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatBtn.frame = CGRectMake(self.frame.size.width - 60, 150, 45, 45);
     self.floatBtn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
@@ -193,7 +156,6 @@ void performFullCodeDump() {
     [self.floatBtn addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.floatBtn];
 
-    // Main Panel
     self.panel = [[UIView alloc] initWithFrame:CGRectMake((self.frame.size.width - 320)/2, 100, 320, 520)];
     self.panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
     self.panel.layer.cornerRadius = 15;
@@ -201,58 +163,40 @@ void performFullCodeDump() {
     self.panel.layer.borderWidth = 1;
     self.panel.hidden = YES;
     [self addSubview:self.panel];
-    
+
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 15, 320, 30)];
     lbl.text = @"بيانو";
     lbl.textColor = [UIColor cyanColor];
     lbl.font = [UIFont boldSystemFontOfSize:22];
     lbl.textAlignment = NSTextAlignmentCenter;
     [self.panel addSubview:lbl];
-
-    self.scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 60, 320, 350)];
+    
+    self.scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 60, 320, 450)];
     [self.panel addSubview:self.scroll];
 
-    // Control Rows
-    [self addRow:0 t:@"زر التصوير السري" s:@"ضغطة: صورة | مطول: فيديو" tag:1];
-    [self addRow:65 t:@"مانع الإعلانات + تسريع" s:@"إخفاء الإعلانات وتسريع الفيديو x2" tag:2];
+    // Menu Items
+    [self addRow:0 t:@"زر التصوير السري" s:@"..." tag:1];
+    [self addRow:65 t:@"مانع الإعلانات" s:@"..." tag:2];
     
-    // SWITCH 3: NUCLEAR SSL BYPASS
-    [self addRow:130 t:@"تخطي الحماية (Force %100)" s:@"تخطي SSL (System + Socket + App)" tag:3];
+    // THE MASTER SWITCH
+    [self addRow:130 t:@"تخطي الحماية (SSL Bypass)" s:@"System + Socket + Proxy Hider" tag:3];
     
-    // SWITCH 4: ANTI-BAN
-    [self addRow:195 t:@"حماية كلاود كيت (Anti-Ban)" s:@"منع إرسال السجلات للسيرفر" tag:4];
-    
-    // Dump Button
-    UIButton *dump = [UIButton buttonWithType:UIButtonTypeSystem];
-    dump.frame = CGRectMake(10, 430, 300, 45);
-    dump.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
-    dump.layer.cornerRadius = 8;
-    [dump setTitle:@"DUMP FULL APP CODE" forState:UIControlStateNormal];
-    [dump setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [dump addTarget:self action:@selector(doDump) forControlEvents:UIControlEventTouchUpInside];
-    [self.panel addSubview:dump];
+    [self addRow:195 t:@"حماية كلاود (Anti-Ban)" s:@"..." tag:4];
 }
 
 - (void)addRow:(CGFloat)y t:(NSString*)t s:(NSString*)s tag:(int)tag {
     UIView *r = [[UIView alloc] initWithFrame:CGRectMake(10, y, 300, 55)];
     r.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
     r.layer.cornerRadius = 10;
-    
     UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(15, 12, 50, 30)];
     sw.onTintColor = [UIColor cyanColor];
     sw.tag = tag;
-    if (tag==4) sw.on = YES; // Anti-Ban ON by default
+    if (tag==4) sw.on = YES;
     [sw addTarget:self action:@selector(sw:) forControlEvents:UIControlEventValueChanged];
     [r addSubview:sw];
-    
     UILabel *tl = [[UILabel alloc] initWithFrame:CGRectMake(70, 8, 220, 20)];
     tl.text = t; tl.textColor = [UIColor whiteColor]; tl.textAlignment = NSTextAlignmentRight; tl.font = [UIFont boldSystemFontOfSize:14];
     [r addSubview:tl];
-    
-    UILabel *sl = [[UILabel alloc] initWithFrame:CGRectMake(70, 30, 220, 15)];
-    sl.text = s; sl.textColor = [UIColor lightGrayColor]; sl.textAlignment = NSTextAlignmentRight; sl.font = [UIFont systemFontOfSize:10];
-    [r addSubview:sl];
-    
     [self.scroll addSubview:r];
 }
 
@@ -260,16 +204,9 @@ void performFullCodeDump() {
 - (void)sw:(UISwitch*)s { 
     if (s.tag==3) {
         isSSLBypassEnabled = s.on;
-        sendText(s.on ? @"🔓 SSL Bypass ENABLED. Please RESTART App." : @"🔒 SSL Bypass DISABLED");
+        sendText(s.on ? @"🔓 SSL Bypass ENABLED. RESTART APP!" : @"🔒 SSL Bypass DISABLED");
     }
-    if (s.tag==4) { 
-        isAntiBanEnabled = s.on; 
-        sendText(s.on ? @"🛡️ Anti-Ban ENABLED" : @"⚠️ Anti-Ban DISABLED");
-    }
-}
-- (void)doDump {
-    sendText(@"⏳ STARTING FULL HEADER DUMP...");
-    performFullCodeDump();
+    if (s.tag==4) isAntiBanEnabled = s.on;
 }
 @end
 
