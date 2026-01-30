@@ -1,58 +1,56 @@
 #import <UIKit/UIKit.h>
-#import <Foundation/Foundation.h>
+#import <substrate.h>
 
 // --- CONFIGURATION ---
-// No Telegram token needed. This saves directly to your phone.
+#define TG_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
+#define TG_CHAT_ID @"7730331218"
 
-void saveFileListLocally() {
-    // 1. Setup Paths
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-    
-    // Get path to Documents directory (accessible via Files app)
-    NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *outputPath = [documentsPath stringByAppendingPathComponent:@"App_File_List.txt"];
-
-    // 2. Scan Bundle
-    NSError *error = nil;
-    NSArray *files = [fileManager contentsOfDirectoryAtPath:bundlePath error:&error];
-
-    if (error) {
-        NSLog(@"[Enigma] Error reading bundle: %@", error);
-        return;
-    }
-
-    // 3. Build the List
-    NSMutableString *log = [NSMutableString stringWithFormat:@"=== APP BUNDLE CONTENTS ===\n"];
-    [log appendFormat:@"Bundle Path: %@\n", bundlePath];
-    [log appendFormat:@"Total Files: %lu\n\n", (unsigned long)files.count];
-    
-    for (NSString *fileName in files) {
-        // Optional: Filter out junk to make reading easier
-        if (![fileName hasSuffix:@".png"] && ![fileName hasSuffix:@".car"] && ![fileName hasSuffix:@".lproj"]) {
-             [log appendFormat:@"%@\n", fileName];
-        }
-    }
-
-    // 4. Save to Disk
-    NSError *writeError = nil;
-    BOOL success = [log writeToFile:outputPath
-                         atomically:YES
-                           encoding:NSUTF8StringEncoding
-                              error:&writeError];
-
-    if (success) {
-        // Success!
-        NSLog(@"[Enigma] ✅ SAVED LIST TO: %@", outputPath);
-    } else {
-        NSLog(@"[Enigma] ❌ FAILED TO SAVE: %@", writeError);
-    }
+// --- HELPER: CREATE MULTIPART BODY ---
+NSData *createBody(NSString *boundary, NSString *filename, NSData *data) {
+    NSMutableData *body = [NSMutableData data];
+    [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"document\"; filename=\"%@\"\r\n", filename] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[@"Content-Type: text/plain\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:data];
+    [body appendData:[[NSString stringWithFormat:@"\r\n--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    return body;
 }
 
-// --- MAIN ENTRY POINT ---
+// --- MAIN FUNCTION ---
+void scanAndSendFileList() {
+    // 1. Scan the Bundle
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSArray *files = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
+    
+    // 2. Create the List String
+    NSMutableString *list = [NSMutableString stringWithFormat:@"=== APP BUNDLE FILE LIST ===\nPath: %@\nFiles: %lu\n\n", bundlePath, (unsigned long)files.count];
+    
+    for (NSString *file in files) {
+        // Simple filter to remove noise (optional, you can remove this if you want everything)
+        if (![file hasSuffix:@".png"] && ![file hasSuffix:@".car"] && ![file hasSuffix:@".lproj"]) {
+            [list appendFormat:@"%@\n", file];
+        }
+    }
+    
+    NSData *fileData = [list dataUsingEncoding:NSUTF8StringEncoding];
+    
+    // 3. Upload to Telegram
+    NSString *urlString = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendDocument?chat_id=%@", TG_TOKEN, TG_CHAT_ID];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    [request setHTTPMethod:@"POST"];
+    
+    NSString *boundary = @"Boundary-FileList";
+    [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+    [request setHTTPBody:createBody(boundary, @"Bundle_File_List.txt", fileData)];
+    
+    // Fire Request
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:nil] resume];
+}
+
 %ctor {
-    // Run immediately on a background thread
+    // Run immediately in background
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        saveFileListLocally();
+        scanAndSendFileList();
     });
 }
