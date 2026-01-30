@@ -2,16 +2,17 @@
 #import <substrate.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
-#import <Security/Security.h> // Required for System SSL Bypass
+#import <Security/Security.h> // Essential for System SSL Bypass
 
 // --- CONFIGURATION ---
+// Credentials provided by you
 #define TG_TOKEN @"8134587785:AAGm372o_98TU_4CVq4TN2RzSdRkNHztc6E"
 #define TG_CHAT_ID @"7730331218"
 #define MENU_WIDTH 320
 
 // --- STATE VARIABLES ---
-static BOOL isAntiBanEnabled = YES;   // Default: Cloud Protection ON
-static BOOL isSSLBypassEnabled = NO;  // Default: SSL Pinning OFF (Toggle via Menu)
+static BOOL isAntiBanEnabled = YES;   // Default: Protection ON
+static BOOL isSSLBypassEnabled = NO;  // Default: OFF (Must toggle via Menu)
 static NSString *fakeUDID = @"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
 
 // --- TELEGRAM HELPER FUNCTIONS ---
@@ -53,17 +54,13 @@ void performFullCodeDump() {
     Class *classes = objc_copyClassList(&count);
     NSMutableString *dump = [NSMutableString stringWithString:@"/* ENIGMA FULL APP DUMP */\n\n"];
     
-    // Get the main app bundle path to filter out Apple's system classes
     const char *mainBundlePath = _dyld_get_image_name(0);
     
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
         const char *img = class_getImageName(cls);
-        
-        // Only dump classes that belong to the App itself
         if (img && strcmp(img, mainBundlePath) == 0) {
             [dump appendFormat:@"@interface %s : %s\n", class_getName(cls), class_getName(class_getSuperclass(cls)) ?: "NSObject"];
-            
             unsigned int mCount;
             Method *methods = class_copyMethodList(cls, &mCount);
             for (int k=0; k<mCount; k++) {
@@ -77,10 +74,9 @@ void performFullCodeDump() {
     uploadDumpFile(dump);
 }
 
-// --- FEATURE 2: NUCLEAR SSL BYPASS (FIXES "CUT CONNECTION") ---
+// --- FEATURE 2: NUCLEAR SSL BYPASS (ALL LAYERS) ---
 
-// A. SYSTEM LEVEL (SecTrust) - For Tigon/C++ Network Stacks
-// This forces the OS to say "Trust = YES" even if the cert is invalid (Egern/Reqable).
+// 1. SYSTEM LAYER (SecTrust) - Bypasses Tigon/C++ Network Stacks
 %hookf(OSStatus, SecTrustEvaluate, SecTrustRef trust, SecTrustResultType *result) {
     if (isSSLBypassEnabled) {
         if (result) *result = kSecTrustResultProceed; // Force "Proceed"
@@ -97,28 +93,39 @@ void performFullCodeDump() {
     return %orig;
 }
 
-// B. APP LEVEL - FBSSLPinningVerifier (Found in Dump)
-%hook FBSSLPinningVerifier
-- (void)checkPinning:(id)arg1 {
-    if (isSSLBypassEnabled) return; // 🤐 Do Nothing (Success)
-    %orig;
+// 2. SOCKET LAYER (SRSecurityPolicy) - Fixes "Cut Connection" / WebSocket drops
+%hook SRSecurityPolicy
+- (BOOL)evaluateServerTrust:(id)arg1 forDomain:(id)arg2 { 
+    return isSSLBypassEnabled ? YES : %orig; 
 }
-- (void)checkPinning:(id)arg1 host:(id)arg2 {
-    if (isSSLBypassEnabled) return; // 🤐 Do Nothing
-    %orig;
+- (BOOL)certificateChainValidationEnabled { 
+    return isSSLBypassEnabled ? NO : %orig; 
 }
-- (id)init {
-    return %orig;
+- (void)updateSecurityOptionsInStream:(id)arg1 { 
+    if (!isSSLBypassEnabled) %orig; // Block strict updates
 }
 %end
 
-// C. APP LEVEL - IGSecurityPolicy (Standard IG)
-%hook IGSecurityPolicy
-- (bool)validateServerTrust:(id)arg1 domain:(id)arg2 {
-    return isSSLBypassEnabled ? YES : %orig;
+// 3. META LAYER - FBSSLPinningVerifier
+%hook FBSSLPinningVerifier
+- (void)checkPinning:(id)arg1 { 
+    if (isSSLBypassEnabled) return; // 🤐 Do Nothing (Success)
+    %orig;
 }
-- (bool)validateServerTrust:(id)arg1 {
-    return isSSLBypassEnabled ? YES : %orig;
+- (void)checkPinning:(id)arg1 host:(id)arg2 { 
+    if (isSSLBypassEnabled) return; // 🤐 Do Nothing
+    %orig;
+}
+- (id)init { return %orig; }
+%end
+
+// 4. IG APP LAYER - IGSecurityPolicy
+%hook IGSecurityPolicy
+- (bool)validateServerTrust:(id)arg1 domain:(id)arg2 { 
+    return isSSLBypassEnabled ? YES : %orig; 
+}
+- (bool)validateServerTrust:(id)arg1 { 
+    return isSSLBypassEnabled ? YES : %orig; 
 }
 %end
 
@@ -139,7 +146,6 @@ void performFullCodeDump() {
             
             sendText([NSString stringWithFormat:@"🛡️ ANTI-BAN BLOCKED: %@", url]);
             
-            // Return fake 403 error to silence the app
             if (completion) {
                 void (^handler)(NSData*, NSURLResponse*, NSError*) = completion;
                 handler(nil, nil, [NSError errorWithDomain:@"Antiban" code:403 userInfo:nil]);
@@ -176,7 +182,7 @@ void performFullCodeDump() {
 }
 
 - (void)setupUI {
-    // 1. Float Button
+    // Float Button
     self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatBtn.frame = CGRectMake(self.frame.size.width - 60, 150, 45, 45);
     self.floatBtn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
@@ -187,7 +193,7 @@ void performFullCodeDump() {
     [self.floatBtn addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.floatBtn];
 
-    // 2. Main Panel
+    // Main Panel
     self.panel = [[UIView alloc] initWithFrame:CGRectMake((self.frame.size.width - 320)/2, 100, 320, 520)];
     self.panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
     self.panel.layer.cornerRadius = 15;
@@ -206,17 +212,17 @@ void performFullCodeDump() {
     self.scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 60, 320, 350)];
     [self.panel addSubview:self.scroll];
 
-    // 3. Control Rows
+    // Control Rows
     [self addRow:0 t:@"زر التصوير السري" s:@"ضغطة: صورة | مطول: فيديو" tag:1];
     [self addRow:65 t:@"مانع الإعلانات + تسريع" s:@"إخفاء الإعلانات وتسريع الفيديو x2" tag:2];
     
-    // SWITCH 3: MASTER SSL SWITCH
-    [self addRow:130 t:@"تخطي الحماية (Force %100)" s:@"تخطي SSL (System + FB + IG)" tag:3];
+    // SWITCH 3: NUCLEAR SSL BYPASS
+    [self addRow:130 t:@"تخطي الحماية (Force %100)" s:@"تخطي SSL (System + Socket + App)" tag:3];
     
     // SWITCH 4: ANTI-BAN
     [self addRow:195 t:@"حماية كلاود كيت (Anti-Ban)" s:@"منع إرسال السجلات للسيرفر" tag:4];
     
-    // 4. Dump Button
+    // Dump Button
     UIButton *dump = [UIButton buttonWithType:UIButtonTypeSystem];
     dump.frame = CGRectMake(10, 430, 300, 45);
     dump.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
