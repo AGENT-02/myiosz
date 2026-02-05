@@ -6,11 +6,9 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = EnigmaFramework
 EnigmaFramework_FILES = Tweak.x
+# CRITICAL: Added AudioToolbox and CoreAudio
+EnigmaFramework_FRAMEWORKS = UIKit CoreGraphics AudioToolbox CoreAudio
 
-# ADDED AVFoundation here so the voice changer works
-EnigmaFramework_FRAMEWORKS = UIKit CoreGraphics QuartzCore AVFoundation
-
-# Note: No PRIVATE_FRAMEWORKS needed because we use dlsym()
-EnigmaFramework_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-error
+EnigmaFramework_CFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk
