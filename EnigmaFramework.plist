@@ -1,1 +1,6 @@
-{ Filter = { Bundles = ( "com.burbn.instagram" ); }; }
+{
+    Filter = {
+        Bundles = ( "com.hammerandchisel.discord" );
+    };
+}
+
