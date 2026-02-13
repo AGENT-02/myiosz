@@ -2,9 +2,10 @@
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
 #import <sys/mman.h>
 
-// --- 1. IL2CPP API DEFINITIONS (For the Scanner) ---
+// --- 1. IL2CPP API DEFINITIONS ---
 typedef void* (*il2cpp_domain_get_t)(void);
 typedef void** (*il2cpp_domain_get_assemblies_t)(void* domain, size_t* size);
 typedef void* (*il2cpp_assembly_get_image_t)(void* assembly);
@@ -14,268 +15,186 @@ typedef const char* (*il2cpp_class_get_name_t)(void* klass);
 typedef void* (*il2cpp_class_get_methods_t)(void* klass, void** iter);
 typedef const char* (*il2cpp_method_get_name_t)(void* method);
 
-// --- 2. MEMORY TOOLS (Jailed Safe) ---
+// --- 2. THE LANDSCAPE-DRIVEN ENGINE ---
 
-// Helper: Convert Hex String to Bytes
-NSData *dataFromHexString(NSString *string) {
-    string = [string stringByReplacingOccurrencesOfString:@" " withString:@""];
-    string = [string stringByReplacingOccurrencesOfString:@"0x" withString:@""];
-    NSMutableData *data = [NSMutableData new];
-    unsigned char whole_byte;
-    char byte_chars[3] = {'\0','\0','\0'};
-    for (int i = 0; i < [string length] / 2; i++) {
-        byte_chars[0] = [string characterAtIndex:i * 2];
-        byte_chars[1] = [string characterAtIndex:i * 2 + 1];
-        whole_byte = strtol(byte_chars, NULL, 16);
-        [data appendBytes:&whole_byte length:1];
-    }
-    return data;
+// Custom Controller to force Landscape/Rotation support
+@interface LandscapeController : UIViewController @end
+@implementation LandscapeController
+- (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+@end
+
+// Pass-through window to ensure clicks hit the game, not the empty menu
+@interface PassThroughWindow : UIWindow @end
+@implementation PassThroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self || hit == self.rootViewController.view) ? nil : hit;
 }
+@end
 
-// Helper: Find Base Address of UnityFramework
-uintptr_t get_unity_base() {
+// --- 3. MEMORY & BASE DETECTION ---
+
+// Finds "cod" main binary or UnityFramework automatically
+uintptr_t get_active_base() {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (strstr(name, "UnityFramework")) {
+        NSString *nsName = [NSString stringWithUTF8String:name];
+        NSString *fileName = [nsName lastPathComponent];
+        
+        if ([fileName containsString:@"UnityFramework"] || [fileName isEqualToString:@"cod"]) {
             return (uintptr_t)_dyld_get_image_header(i);
         }
     }
-    // Fallback for games statically linked
     return (uintptr_t)_dyld_get_image_header(0);
 }
 
-// THE FIX: Standard Jailed Write (No Copy Flag)
-kern_return_t write_memory(uintptr_t address, void *data, size_t size) {
+// Jailed-safe write to bypass Error 3 (No VM_PROT_COPY)
+kern_return_t safe_write(uintptr_t address, void *data, size_t size) {
     mach_port_t task = mach_task_self();
-    kern_return_t kr;
-
-    // 1. Align to Page
     vm_address_t page_start = address & ~PAGE_MASK;
     vm_address_t page_end = (address + size + PAGE_MASK) & ~PAGE_MASK;
     vm_size_t page_size = page_end - page_start;
 
-    // 2. Unlock (Read + Write) - REMOVED VM_PROT_COPY TO FIX ERROR 3
-    kr = mach_vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    kern_return_t kr = mach_vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) return kr;
 
-    // 3. Write
     kr = mach_vm_write(task, address, (vm_offset_t)data, (mach_msg_type_number_t)size);
-    if (kr != KERN_SUCCESS) {
-        // Backup: memcpy
-        memcpy((void *)address, data, size);
-    }
+    if (kr != KERN_SUCCESS) memcpy((void *)address, data, size);
 
-    // 4. Lock (Read + Execute)
     mach_vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-    
     return KERN_SUCCESS;
 }
 
-NSString *apply_patch(uint64_t offset, NSString *hexStr) {
-    NSData *data = dataFromHexString(hexStr);
-    if (!data || data.length == 0) return @"Invalid Hex";
-
-    uintptr_t base = get_unity_base();
-    uintptr_t finalAddr = base + offset;
-
-    kern_return_t kr = write_memory(finalAddr, (void *)[data bytes], [data length]);
-    
-    if (kr == KERN_SUCCESS) return @"✅ Patch Applied!";
-    return [NSString stringWithFormat:@"❌ Fail: Kernel Error %d", kr];
-}
-
-// --- 3. UNITY INSPECTOR (Scanner) ---
-NSString *scan_unity_methods(NSString *keyword) {
-    NSMutableString *log = [NSMutableString stringWithString:@"--- Results ---\n"];
-    
-    void *handle = dlopen("UnityFramework.framework/UnityFramework", RTLD_LAZY);
-    if (!handle) handle = dlopen(NULL, RTLD_LAZY);
-    if (!handle) return @"❌ Error: Unity Not Found";
-
-    // Load Il2Cpp Functions
-    il2cpp_domain_get_t domain_get = (il2cpp_domain_get_t)dlsym(handle, "il2cpp_domain_get");
-    il2cpp_domain_get_assemblies_t get_assemblies = (il2cpp_domain_get_assemblies_t)dlsym(handle, "il2cpp_domain_get_assemblies");
-    il2cpp_assembly_get_image_t get_image = (il2cpp_assembly_get_image_t)dlsym(handle, "il2cpp_assembly_get_image");
-    il2cpp_image_get_class_count_t get_class_count = (il2cpp_image_get_class_count_t)dlsym(handle, "il2cpp_image_get_class_count");
-    il2cpp_image_get_class_t get_class = (il2cpp_image_get_class_t)dlsym(handle, "il2cpp_image_get_class");
-    il2cpp_class_get_name_t class_get_name = (il2cpp_class_get_name_t)dlsym(handle, "il2cpp_class_get_name");
-    il2cpp_class_get_methods_t class_get_methods = (il2cpp_class_get_methods_t)dlsym(handle, "il2cpp_class_get_methods");
-    il2cpp_method_get_name_t method_get_name = (il2cpp_method_get_name_t)dlsym(handle, "il2cpp_method_get_name");
-
-    if (!domain_get) return @"❌ Error: Symbols Hidden";
-
-    uintptr_t base = get_unity_base();
-    size_t asm_count = 0;
-    void **assemblies = get_assemblies(domain_get(), &asm_count);
-    int foundCount = 0;
-
-    for (int i = 0; i < asm_count; i++) {
-        void *image = get_image(assemblies[i]);
-        size_t classCount = get_class_count(image);
-        
-        for (int c = 0; c < classCount; c++) {
-            void *klass = get_class(image, c);
-            const char *cNamePtr = class_get_name(klass);
-            if (!cNamePtr) continue;
-            NSString *className = [NSString stringWithUTF8String:cNamePtr];
-            
-            // Skip common junk
-            if ([className hasPrefix:@"System"] || [className hasPrefix:@"UnityEngine"]) continue;
-
-            void *iter = NULL;
-            void *method = NULL;
-            while ((method = class_get_methods(klass, &iter))) {
-                const char *mNamePtr = method_get_name(method);
-                if (!mNamePtr) continue;
-                NSString *methodName = [NSString stringWithUTF8String:mNamePtr];
-
-                if ([className localizedCaseInsensitiveContainsString:keyword] || 
-                    [methodName localizedCaseInsensitiveContainsString:keyword]) {
-                    
-                    uintptr_t ptr = *(uintptr_t*)method; // Get Pointer
-                    if (ptr > base) {
-                        uintptr_t offset = ptr - base;
-                        [log appendFormat:@"0x%lx : %@[%@]\n", offset, className, methodName];
-                        foundCount++;
-                    }
-                }
-            }
-        }
-        if (foundCount > 50) break;
+NSData *hexToBytes(NSString *str) {
+    str = [str stringByReplacingOccurrencesOfString:@" " withString:@""];
+    NSMutableData *data = [NSMutableData data];
+    unsigned char byte;
+    char chars[3] = {'\0', '\0', '\0'};
+    for (int i = 0; i < [str length] / 2; i++) {
+        chars[0] = [str characterAtIndex:i*2]; chars[1] = [str characterAtIndex:i*2+1];
+        byte = strtol(chars, NULL, 16);
+        [data appendBytes:&byte length:1];
     }
-    
-    if (foundCount == 0) return @"No matches found.";
-    return log;
+    return data;
 }
 
-// --- 4. FLOATING UI (Pass-Through) ---
+// --- 4. THE SCANNER & MENU ---
 
-@interface PassThroughWindow : UIWindow @end
-@implementation PassThroughWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hitView = [super hitTest:point withEvent:event];
-    if (hitView == self || hitView == self.rootViewController.view) return nil;
-    return hitView;
-}
-@end
-
-@interface MenuManager : NSObject
-@property (nonatomic, strong) PassThroughWindow *overlayWindow;
-@property (nonatomic, strong) UIButton *menuBtn;
+@interface ModMenu : NSObject
+@property (nonatomic, strong) PassThroughWindow *window;
+@property (nonatomic, strong) UIButton *btn;
 + (instancetype)shared;
 @end
 
-@implementation MenuManager
+@implementation ModMenu
 + (instancetype)shared {
-    static MenuManager *s = nil;
-    static dispatch_once_t t;
-    dispatch_once(&t, ^{ s = [MenuManager new]; });
-    return s;
+    static ModMenu *m; static dispatch_once_t t;
+    dispatch_once(&t, ^{ m = [ModMenu new]; }); return m;
 }
 
-- (void)start { [self performSelector:@selector(findScene) withObject:nil afterDelay:1.0]; }
-
-- (void)findScene {
-    UIWindowScene *activeScene = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if (s.activationState == UISceneActivationStateForegroundActive) { activeScene = (UIWindowScene*)s; break; }
+- (void)setup {
+    UIWindowScene *scene = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene*)s; break; }
     }
-    if (!activeScene) { [self performSelector:@selector(findScene) withObject:nil afterDelay:1.0]; return; }
-    [self setupWindow:activeScene];
-}
+    if (!scene) { [self performSelector:@selector(setup) withObject:nil afterDelay:1.0]; return; }
 
-- (void)setupWindow:(UIWindowScene *)scene {
-    if (self.overlayWindow) return;
-    self.overlayWindow = [[PassThroughWindow alloc] initWithWindowScene:scene];
-    self.overlayWindow.frame = [UIScreen mainScreen].bounds;
-    self.overlayWindow.windowLevel = UIWindowLevelAlert + 1;
-    self.overlayWindow.backgroundColor = [UIColor clearColor];
+    self.window = [[PassThroughWindow alloc] initWithWindowScene:scene];
+    self.window.frame = UIScreen.mainScreen.bounds;
+    self.window.windowLevel = UIWindowLevelAlert + 1;
+    self.window.rootViewController = [LandscapeController new]; // Forces Landscape
+    self.window.hidden = NO;
+
+    self.btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.btn.frame = CGRectMake(100, 100, 55, 55);
+    self.btn.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.8];
+    [self.btn setTitle:@"🎭" forState:UIControlStateNormal];
+    self.btn.layer.cornerRadius = 27.5;
+    self.btn.layer.borderColor = [UIColor cyanColor].CGColor;
+    self.btn.layer.borderWidth = 2;
+    [self.btn addTarget:self action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
     
-    UIViewController *rootVC = [UIViewController new];
-    rootVC.view.backgroundColor = [UIColor clearColor];
-    self.overlayWindow.rootViewController = rootVC;
-    self.overlayWindow.hidden = NO;
-    [self createButton];
-}
-
-- (void)createButton {
-    self.menuBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.menuBtn.frame = CGRectMake(20, 100, 50, 50);
-    self.menuBtn.backgroundColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.1 alpha:0.9];
-    [self.menuBtn setTitle:@"🔥" forState:UIControlStateNormal];
-    self.menuBtn.layer.cornerRadius = 25;
-    self.menuBtn.layer.borderColor = [UIColor redColor].CGColor;
-    self.menuBtn.layer.borderWidth = 2;
-    [self.menuBtn addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
     UIPanGestureRecognizer *p = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
-    [self.menuBtn addGestureRecognizer:p];
-    [self.overlayWindow.rootViewController.view addSubview:self.menuBtn];
+    [self.btn addGestureRecognizer:p];
+    [self.window.rootViewController.view addSubview:self.btn];
 }
 
 - (void)drag:(UIPanGestureRecognizer *)p {
-    UIView *v = p.view;
-    CGPoint t = [p translationInView:self.overlayWindow];
+    UIView *v = p.view; CGPoint t = [p translationInView:self.window];
     v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-    [p setTranslation:CGPointZero inView:self.overlayWindow];
+    [p setTranslation:CGPointZero inView:self.window];
 }
 
-- (void)showMenu {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Mod Menu" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    
-    // SCANNER
-    [ac addAction:[UIAlertAction actionWithTitle:@"Find Offsets" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-        UIAlertController *s = [UIAlertController alertControllerWithTitle:@"Scanner" message:@"Search (e.g. Coin, Health)" preferredStyle:UIAlertControllerStyleAlert];
-        [s addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Keyword"; }];
-        [s addAction:[UIAlertAction actionWithTitle:@"Scan" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-            NSString *res = scan_unity_methods(s.textFields[0].text);
-            UIPasteboard.generalPasteboard.string = res; // Auto-copy
-            [self showTextResult:res];
+- (NSString *)scan:(NSString *)keyword {
+    NSMutableString *log = [NSMutableString stringWithString:@"--- Results ---\n"];
+    void *h = dlopen(NULL, RTLD_LAZY);
+    il2cpp_domain_get_t d_get = (il2cpp_domain_get_t)dlsym(h, "il2cpp_domain_get");
+    il2cpp_domain_get_assemblies_t a_get = (il2cpp_domain_get_assemblies_t)dlsym(h, "il2cpp_domain_get_assemblies");
+    il2cpp_assembly_get_image_t i_get = (il2cpp_assembly_get_image_t)dlsym(h, "il2cpp_assembly_get_image");
+    il2cpp_image_get_class_count_t cc = (il2cpp_image_get_class_count_t)dlsym(h, "il2cpp_image_get_class_count");
+    il2cpp_image_get_class_t cg = (il2cpp_image_get_class_t)dlsym(h, "il2cpp_image_get_class");
+    il2cpp_class_get_name_t cn = (il2cpp_class_get_name_t)dlsym(h, "il2cpp_class_get_name");
+    il2cpp_class_get_methods_t cm = (il2cpp_class_get_methods_t)dlsym(h, "il2cpp_class_get_methods");
+    il2cpp_method_get_name_t mn = (il2cpp_method_get_name_t)dlsym(h, "il2cpp_method_get_name");
+
+    if (!d_get) return @"❌ Unity symbols not found.";
+
+    uintptr_t base = get_active_base();
+    size_t count = 0; void **asms = a_get(d_get(), &count);
+    for (int i = 0; i < count; i++) {
+        void *img = i_get(asms[i]); size_t clCount = cc(img);
+        for (int c = 0; c < clCount; c++) {
+            void *kl = cg(img, c); const char *name = cn(kl); if (!name) continue;
+            NSString *cN = [NSString stringWithUTF8String:name];
+            void *it = NULL; void *m = NULL;
+            while ((m = cm(kl, &it))) {
+                NSString *mN = [NSString stringWithUTF8String:mn(m)];
+                if ([cN localizedCaseInsensitiveContainsString:keyword] || [mN localizedCaseInsensitiveContainsString:keyword]) {
+                    uintptr_t p = *(uintptr_t*)m; if (p > base) [log appendFormat:@"0x%lx : %@[%@]\n", p - base, cN, mN];
+                }
+            }
+        }
+    }
+    return log;
+}
+
+- (void)openMenu {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"COD LANDSCAPE MOD" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🔍 Scanner (MP/Aim)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIAlertController *s = [UIAlertController alertControllerWithTitle:@"Scan" message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [s addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder = @"Mp, Health, Weapon..."; }];
+        [s addAction:[UIAlertAction actionWithTitle:@"Go" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            NSString *r = [self scan:s.textFields[0].text]; UIPasteboard.generalPasteboard.string = r;
+            [self showRes:r];
         }]];
-        [s addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [self.overlayWindow.rootViewController presentViewController:s animated:YES completion:nil];
+        [self.window.rootViewController presentViewController:s animated:YES completion:nil];
     }]];
-    
-    // PATCHER
-    [ac addAction:[UIAlertAction actionWithTitle:@"Apply Patch" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
-        UIAlertController *p = [UIAlertController alertControllerWithTitle:@"Patcher" message:nil preferredStyle:UIAlertControllerStyleAlert];
-        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Offset (0x...)"; }];
-        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Hex (e.g. C0035FD6)"; }];
-        [p addAction:[UIAlertAction actionWithTitle:@"Apply" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
-            NSString *res = apply_patch(strtoull([p.textFields[0].text UTF8String], NULL, 16), p.textFields[1].text);
-            [self alertRes:res];
+    [ac addAction:[UIAlertAction actionWithTitle:@"💉 Patch" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        UIAlertController *p = [UIAlertController alertControllerWithTitle:@"Patch" message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder = @"Offset"; }];
+        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder = @"Hex"; }];
+        [p addAction:[UIAlertAction actionWithTitle:@"Patch" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+            uint64_t o = strtoull([p.textFields[0].text UTF8String], NULL, 16); NSData *h = hexToBytes(p.textFields[1].text);
+            kern_return_t kr = safe_write(get_active_base() + o, (void *)[h bytes], [h length]);
+            [self showRes:(kr == KERN_SUCCESS ? @"Applied!" : @"Error")];
         }]];
-        [p addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [self.overlayWindow.rootViewController presentViewController:p animated:YES completion:nil];
+        [self.window.rootViewController presentViewController:p animated:YES completion:nil];
     }]];
-    
     [ac addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
-    [self.overlayWindow.rootViewController presentViewController:ac animated:YES completion:nil];
+    [self.window.rootViewController presentViewController:ac animated:YES completion:nil];
 }
 
-- (void)showTextResult:(NSString *)text {
-    UIAlertController *res = [UIAlertController alertControllerWithTitle:@"Results (Copied)" message:nil preferredStyle:UIAlertControllerStyleAlert];
-    [res addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
-    UIViewController *vc = [UIViewController new];
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 0, 270, 300)];
-    tv.text = text;
-    tv.editable = NO;
-    tv.font = [UIFont systemFontOfSize:10];
-    vc.preferredContentSize = CGSizeMake(270, 300);
-    [vc.view addSubview:tv];
-    [res setValue:vc forKey:@"contentViewController"];
-    [self.overlayWindow.rootViewController presentViewController:res animated:YES completion:nil];
-}
-
-- (void)alertRes:(NSString *)msg {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:msg message:nil preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-    [self.overlayWindow.rootViewController presentViewController:a animated:YES completion:nil];
+- (void)showRes:(NSString *)t {
+    UIAlertController *r = [UIAlertController alertControllerWithTitle:@"System" message:t preferredStyle:UIAlertControllerStyleAlert];
+    [r addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    [self.window.rootViewController presentViewController:r animated:YES completion:nil];
 }
 @end
 
 %ctor {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [[MenuManager shared] start];
+        [[ModMenu shared] setup];
     });
 }
