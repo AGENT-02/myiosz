@@ -1,15 +1,14 @@
 #import <UIKit/UIKit.h>
-#import <AudioToolbox/AudioToolbox.h> // For vibration
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
 #import <sys/mman.h>
 
-// --- DECLARE MISSING FUNCTION ---
+// --- DECLARATIONS ---
 extern void sys_icache_invalidate(void *start, size_t len);
 
-// --- 1. MEMORY PATCHING ENGINE ---
-
+// --- 1. MEMORY PATCHER ---
 NSData *dataFromHexString(NSString *string) {
     string = [string stringByReplacingOccurrencesOfString:@" " withString:@""];
     string = [string stringByReplacingOccurrencesOfString:@"0x" withString:@""];
@@ -27,155 +26,205 @@ NSData *dataFromHexString(NSString *string) {
 
 NSString *apply_patch(uint64_t offset, NSString *hexStr) {
     NSData *data = dataFromHexString(hexStr);
-    if (!data || data.length == 0) return @"Invalid Hex Data";
-
+    if (!data || data.length == 0) return @"Invalid Hex";
     uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
     uintptr_t addr = base + offset;
-
     vm_size_t size = data.length;
     vm_address_t page_start = addr & ~PAGE_MASK;
     vm_address_t page_end = (addr + size + PAGE_MASK) & ~PAGE_MASK;
     vm_size_t page_size = page_end - page_start;
-
+    
     kern_return_t kr = vm_protect(mach_task_self(), page_start, page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"Error: Unlock Failed (%d)", kr];
-
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"Unlock Fail: %d", kr];
+    
     memcpy((void *)addr, [data bytes], size);
     vm_protect(mach_task_self(), page_start, page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
     sys_icache_invalidate((void *)addr, size);
-
-    return @"Patch Applied!";
+    return @"Patched!";
 }
 
-// --- 2. ROBUST UI MANAGER ---
+// --- 2. OFFSET INSPECTOR (The Scraper) ---
+// This scans ObjC runtime for methods matching your query
+NSString *scan_methods(NSString *keyword) {
+    NSMutableString *results = [NSMutableString stringWithFormat:@"--- Scanning for '%@' ---\n", keyword];
+    int count = 0;
+    
+    // Get Base Address to calculate offsets
+    uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
+
+    // Get all classes
+    int numClasses = objc_getClassList(NULL, 0);
+    Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
+    numClasses = objc_getClassList(classes, numClasses);
+
+    for (int i = 0; i < numClasses; i++) {
+        Class cls = classes[i];
+        const char *cName = class_getName(cls);
+        NSString *className = [NSString stringWithUTF8String:cName];
+
+        // Filter: Skip system classes to speed up (optional)
+        if ([className hasPrefix:@"UI"] || [className hasPrefix:@"NS"] || [className hasPrefix:@"_"]) continue;
+
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(cls, &methodCount);
+
+        for (unsigned int j = 0; j < methodCount; j++) {
+            Method m = methods[j];
+            SEL sel = method_getName(m);
+            const char *selName = sel_getName(sel);
+            NSString *selectorName = [NSString stringWithUTF8String:selName];
+
+            // SEARCH LOGIC: Check if Class or Method contains keyword
+            if (([className localizedCaseInsensitiveContainsString:keyword] || 
+                 [selectorName localizedCaseInsensitiveContainsString:keyword])) {
+                
+                uintptr_t imp = (uintptr_t)method_getImplementation(m);
+                // Calculate Offset: IMP - Base
+                // Note: Only works if IMP is inside the main binary.
+                if (imp > base) {
+                    uintptr_t offset = imp - base;
+                    [results appendFormat:@"0x%lx : [%@ %@]\n", offset, className, selectorName];
+                    count++;
+                }
+            }
+        }
+        free(methods);
+        if (count > 50) { // Limit results to prevent lag
+            [results appendString:@"... (Too many results, refine search)\n"];
+            break; 
+        }
+    }
+    free(classes);
+    
+    if (count == 0) return @"No matches found.";
+    return results;
+}
+
+// --- 3. UI SYSTEM ---
+
+@interface PassThroughWindow : UIWindow @end
+@implementation PassThroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hitView = [super hitTest:point withEvent:event];
+    if (hitView == self) return nil;
+    return hitView;
+}
+@end
 
 @interface MenuManager : NSObject
-@property (nonatomic, strong) UIWindow *overlayWindow;
+@property (nonatomic, strong) PassThroughWindow *overlayWindow;
 @property (nonatomic, strong) UIButton *menuBtn;
-@property (nonatomic, strong) NSTimer *loadTimer;
 + (instancetype)shared;
-- (void)tryToLoadMenu;
 @end
 
 @implementation MenuManager
-
 + (instancetype)shared {
-    static MenuManager *shared = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        shared = [[MenuManager alloc] init];
-    });
-    return shared;
+    static MenuManager *s = nil;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{ s = [MenuManager new]; });
+    return s;
 }
 
-- (void)start {
-    // Retry every 2 seconds until we find a valid scene
-    self.loadTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(tryToLoadMenu) userInfo:nil repeats:YES];
-}
+- (void)start { [self performSelector:@selector(findScene) withObject:nil afterDelay:1.0]; }
 
-- (void)tryToLoadMenu {
+- (void)findScene {
     UIWindowScene *activeScene = nil;
-    
-    // 1. Find the active scene
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
-            activeScene = (UIWindowScene *)scene;
-            break;
-        }
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (s.activationState == UISceneActivationStateForegroundActive) { activeScene = (UIWindowScene*)s; break; }
     }
+    if (!activeScene) { [self performSelector:@selector(findScene) withObject:nil afterDelay:1.0]; return; }
+    [self setupWindow:activeScene];
+}
 
-    // If no scene found yet, return and wait for next timer tick
-    if (!activeScene) return;
-
-    // 2. Found a scene! Stop timer and build UI.
-    [self.loadTimer invalidate];
-    self.loadTimer = nil;
-
-    // Vibrate to tell user we loaded
-    AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-    
-    // 3. Create Window attached to Scene
-    self.overlayWindow = [[UIWindow alloc] initWithWindowScene:activeScene];
+- (void)setupWindow:(UIWindowScene *)scene {
+    if (self.overlayWindow) return;
+    self.overlayWindow = [[PassThroughWindow alloc] initWithWindowScene:scene];
     self.overlayWindow.frame = [UIScreen mainScreen].bounds;
-    self.overlayWindow.windowLevel = UIWindowLevelStatusBar + 50.0; // Very high
+    self.overlayWindow.windowLevel = UIWindowLevelAlert + 1;
     self.overlayWindow.backgroundColor = [UIColor clearColor];
     self.overlayWindow.rootViewController = [UIViewController new];
-    self.overlayWindow.userInteractionEnabled = YES; // Must be YES, but we handle hitTest manually
     self.overlayWindow.hidden = NO;
-    [self.overlayWindow makeKeyAndVisible];
-
-    // 4. Create Button
+    
     self.menuBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.menuBtn.frame = CGRectMake(50, 150, 60, 60);
-    self.menuBtn.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.8];
-    [self.menuBtn setTitle:@"⚙️" forState:UIControlStateNormal];
-    self.menuBtn.titleLabel.font = [UIFont systemFontOfSize:30];
-    self.menuBtn.layer.cornerRadius = 30;
-    self.menuBtn.layer.borderColor = [UIColor redColor].CGColor;
+    self.menuBtn.frame = CGRectMake(20, 100, 50, 50);
+    self.menuBtn.backgroundColor = [UIColor blackColor];
+    [self.menuBtn setTitle:@"🕵️" forState:UIControlStateNormal];
+    self.menuBtn.layer.cornerRadius = 25;
+    self.menuBtn.layer.borderColor = [UIColor greenColor].CGColor;
     self.menuBtn.layer.borderWidth = 2;
+    [self.menuBtn addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
     
-    [self.menuBtn addTarget:self action:@selector(showPopup) forControlEvents:UIControlEventTouchUpInside];
-    
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleDrag:)];
-    [self.menuBtn addGestureRecognizer:pan];
-
+    UIPanGestureRecognizer *p = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
+    [self.menuBtn addGestureRecognizer:p];
     [self.overlayWindow addSubview:self.menuBtn];
-    
-    // Bring window to front again just in case
-    [self.overlayWindow.layer setZPosition:MAXFLOAT];
 }
 
-// Pass touches through empty space
-// We override the getter of the window to swap hit testing behavior
-// But for simplicity in a single file, we can just be careful with size.
-// Since we made the window full screen, we need to ensure it doesn't block touches.
-// The easiest way in a simple Tweak.x is to actually ADD the button to the KeyWindow if possible,
-// OR use this trick:
-
-- (void)handleDrag:(UIPanGestureRecognizer *)p {
+- (void)drag:(UIPanGestureRecognizer *)p {
     UIView *v = p.view;
     CGPoint t = [p translationInView:self.overlayWindow];
     v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
     [p setTranslation:CGPointZero inView:self.overlayWindow];
 }
 
-- (void)showPopup {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Patcher" message:@"Enter Offset & Hex" preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Offset (0x...)"; }];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Hex (C003...)"; }];
+- (void)showMenu {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Inspector" message:@"Choose Action" preferredStyle:UIAlertControllerStyleActionSheet];
     
-    [alert addAction:[UIAlertAction actionWithTitle:@"Apply" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        NSString *res = apply_patch(strtoull([alert.textFields[0].text UTF8String], NULL, 16), alert.textFields[1].text);
-        
-        UIAlertController *resA = [UIAlertController alertControllerWithTitle:res message:nil preferredStyle:UIAlertControllerStyleAlert];
-        [resA addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-        [self.overlayWindow.rootViewController presentViewController:resA animated:YES completion:nil];
+    // ACTION 1: PATCHER
+    [ac addAction:[UIAlertAction actionWithTitle:@"Apply Hex Patch" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *p = [UIAlertController alertControllerWithTitle:@"Patcher" message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Offset (0x...)"; }];
+        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Hex (C003...)"; }];
+        [p addAction:[UIAlertAction actionWithTitle:@"Apply" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+            NSString *res = apply_patch(strtoull([p.textFields[0].text UTF8String], NULL, 16), p.textFields[1].text);
+            [self alertRes:res];
+        }]];
+        [p addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [self.overlayWindow.rootViewController presentViewController:p animated:YES completion:nil];
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self.overlayWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+    
+    // ACTION 2: SCRAPER (OFFSET FINDER)
+    [ac addAction:[UIAlertAction actionWithTitle:@"Search Offsets (Scrape)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *s = [UIAlertController alertControllerWithTitle:@"Offset Scraper" message:@"Enter keyword (e.g. Health, Coin)" preferredStyle:UIAlertControllerStyleAlert];
+        [s addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Keyword"; }];
+        [s addAction:[UIAlertAction actionWithTitle:@"Scan" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            NSString *logs = scan_methods(s.textFields[0].text);
+            
+            // Show results in a text view alert
+            UIAlertController *res = [UIAlertController alertControllerWithTitle:@"Results" message:nil preferredStyle:UIAlertControllerStyleAlert];
+            [res addAction:[UIAlertAction actionWithTitle:@"Copy to Clipboard" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                [UIPasteboard generalPasteboard].string = logs;
+            }]];
+            [res addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+            
+            // Hacky Text View in Alert
+            UIViewController *vc = [[UIViewController alloc] init];
+            UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 0, 270, 300)];
+            tv.text = logs;
+            tv.editable = NO;
+            tv.font = [UIFont fontWithName:@"Courier" size:10];
+            vc.preferredContentSize = CGSizeMake(270, 300);
+            [vc.view addSubview:tv];
+            [res setValue:vc forKey:@"contentViewController"];
+            
+            [self.overlayWindow.rootViewController presentViewController:res animated:YES completion:nil];
+        }]];
+        [s addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [self.overlayWindow.rootViewController presentViewController:s animated:YES completion:nil];
+    }]];
+    
+    [ac addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [self.overlayWindow.rootViewController presentViewController:ac animated:YES completion:nil];
 }
 
+- (void)alertRes:(NSString *)msg {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"System" message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    [self.overlayWindow.rootViewController presentViewController:a animated:YES completion:nil];
+}
 @end
 
-// Helper to make clicks pass through the window
-// We use method swizzling or just a subclass. Since we are in Tweak.x, let's just Hook UIWindow pointInside.
-// This ensures that if the user clicks OUTSIDE the button, the click goes to the game.
-
-%hook UIWindow
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    // Check if this is OUR overlay window
-    if (self == [MenuManager shared].overlayWindow) {
-        if (CGRectContainsPoint([MenuManager shared].menuBtn.frame, point)) {
-            return YES; // Clicked the button
-        }
-        return NO; // Clicked empty space -> pass to game
-    }
-    return %orig;
-}
-%end
-
 %ctor {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [[MenuManager shared] start];
     });
 }
