@@ -2,7 +2,10 @@
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
-#import <sys/mman.h> // Required for mprotect constants
+#import <sys/mman.h>
+
+// --- FIX: Manually declare the missing function ---
+extern void sys_icache_invalidate(void *start, size_t len);
 
 // --- 1. MEMORY PATCHING ENGINE ---
 
@@ -28,9 +31,6 @@ NSData *dataFromHexString(NSString *string) {
 
 /*
  * The Patch Function
- * 1. Unlocks memory (RWX)
- * 2. Writes bytes
- * 3. Relocks memory (RX)
  */
 NSString *apply_patch(uint64_t offset, NSString *hexStr) {
     NSData *data = dataFromHexString(hexStr);
@@ -46,8 +46,7 @@ NSString *apply_patch(uint64_t offset, NSString *hexStr) {
     vm_address_t page_end = (addr + size + PAGE_MASK) & ~PAGE_MASK;
     vm_size_t page_size = page_end - page_start;
 
-    // Unlock Memory
-    // Note: vm_protect is used here. If this fails on Jailed, JIT is likely missing.
+    // Unlock Memory (RWX)
     kern_return_t kr = vm_protect(mach_task_self(), page_start, page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     
     if (kr != KERN_SUCCESS) {
@@ -57,10 +56,10 @@ NSString *apply_patch(uint64_t offset, NSString *hexStr) {
     // Write Data
     memcpy((void *)addr, [data bytes], size);
 
-    // Relock Memory
+    // Relock Memory (RX)
     vm_protect(mach_task_self(), page_start, page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
 
-    // Flush CPU Cache (Important for ARM64)
+    // Flush CPU Cache
     sys_icache_invalidate((void *)addr, size);
 
     return @"Patch Applied Successfully!";
@@ -159,7 +158,7 @@ NSString *apply_patch(uint64_t offset, NSString *hexStr) {
         // Apply
         NSString *result = apply_patch(offset, hexStr);
         
-        // Show Result Toast
+        // Show Result
         UIAlertController *resAlert = [UIAlertController alertControllerWithTitle:@"Result" 
                                                                           message:result 
                                                                    preferredStyle:UIAlertControllerStyleAlert];
@@ -178,7 +177,6 @@ NSString *apply_patch(uint64_t offset, NSString *hexStr) {
 // --- 3. CONSTRUCTOR ---
 
 %ctor {
-    // Wait 5 seconds for the app to launch fully before adding our UI
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [FloatingMenu shared];
     });
