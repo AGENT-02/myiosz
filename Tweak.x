@@ -2,13 +2,121 @@
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
-#import <objc/runtime.h>
 #import <sys/mman.h>
 
-// --- DECLARATIONS ---
+// --- IL2CPP API DEFINITIONS (Minimal) ---
+typedef void* (*il2cpp_domain_get_t)(void);
+typedef void** (*il2cpp_domain_get_assemblies_t)(void* domain, size_t* size);
+typedef void* (*il2cpp_assembly_get_image_t)(void* assembly);
+typedef size_t (*il2cpp_image_get_class_count_t)(void* image);
+typedef void* (*il2cpp_image_get_class_t)(void* image, size_t index);
+typedef const char* (*il2cpp_class_get_name_t)(void* klass);
+typedef void* (*il2cpp_class_get_methods_t)(void* klass, void** iter);
+typedef const char* (*il2cpp_method_get_name_t)(void* method);
+typedef uintptr_t (*il2cpp_method_get_pointer_t)(void* method); // Returns absolute address
+
+// --- HELPERS ---
+uintptr_t get_image_base(const char* image_name) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (strstr(name, image_name)) {
+            return (uintptr_t)_dyld_get_image_header(i);
+        }
+    }
+    return 0;
+}
+
+// --- 1. THE UNITY SCRAPER ---
+NSString *scan_unity_methods(NSString *keyword) {
+    NSMutableString *log = [NSMutableString stringWithString:@"--- IL2CPP Scan Results ---\n"];
+    
+    // 1. Find UnityFramework Handle
+    void *handle = dlopen(NULL, RTLD_LAZY); // Search global scope first
+    if (!dlsym(handle, "il2cpp_domain_get")) {
+        // If not found globally, try opening UnityFramework directly
+        handle = dlopen("UnityFramework.framework/UnityFramework", RTLD_LAZY);
+    }
+    
+    if (!handle) return @"Error: Could not find UnityFramework.";
+
+    // 2. Resolve Functions
+    il2cpp_domain_get_t il2cpp_domain_get = (il2cpp_domain_get_t)dlsym(handle, "il2cpp_domain_get");
+    il2cpp_domain_get_assemblies_t il2cpp_domain_get_assemblies = (il2cpp_domain_get_assemblies_t)dlsym(handle, "il2cpp_domain_get_assemblies");
+    il2cpp_assembly_get_image_t il2cpp_assembly_get_image = (il2cpp_assembly_get_image_t)dlsym(handle, "il2cpp_assembly_get_image");
+    il2cpp_image_get_class_count_t il2cpp_image_get_class_count = (il2cpp_image_get_class_count_t)dlsym(handle, "il2cpp_image_get_class_count");
+    il2cpp_image_get_class_t il2cpp_image_get_class = (il2cpp_image_get_class_t)dlsym(handle, "il2cpp_image_get_class");
+    il2cpp_class_get_name_t il2cpp_class_get_name = (il2cpp_class_get_name_t)dlsym(handle, "il2cpp_class_get_name");
+    il2cpp_class_get_methods_t il2cpp_class_get_methods = (il2cpp_class_get_methods_t)dlsym(handle, "il2cpp_class_get_methods");
+    il2cpp_method_get_name_t il2cpp_method_get_name = (il2cpp_method_get_name_t)dlsym(handle, "il2cpp_method_get_name");
+    
+    // Some newer Unity versions use a different API for getting function pointers
+    // But usually method->methodPointer is at offset 0 or accessible. 
+    // For simplicity in a tweak, we will assume standard layout or use basic offset calc.
+    
+    if (!il2cpp_domain_get) return @"Error: Il2Cpp symbols hidden/stripped.";
+
+    // 3. Get Domain & Assemblies
+    void *domain = il2cpp_domain_get();
+    size_t asm_count = 0;
+    void **assemblies = il2cpp_domain_get_assemblies(domain, &asm_count);
+    
+    uintptr_t unityBase = get_image_base("UnityFramework");
+    if (unityBase == 0) unityBase = get_image_base("MY_APP_NAME"); // Fallback
+
+    int foundCount = 0;
+
+    for (int i = 0; i < asm_count; i++) {
+        void *image = il2cpp_assembly_get_image(assemblies[i]);
+        // We mostly care about Assembly-CSharp (Game Logic)
+        // You can remove this 'if' to scan EVERYTHING (Engine, UI, etc)
+        // if (i != 0) continue; 
+        
+        size_t classCount = il2cpp_image_get_class_count(image);
+        
+        for (int c = 0; c < classCount; c++) {
+            void *klass = il2cpp_image_get_class(image, c);
+            const char *cName = il2cpp_class_get_name(klass);
+            if (!cName) continue;
+            NSString *className = [NSString stringWithUTF8String:cName];
+            
+            // Optimization: Skip system classes
+            if ([className hasPrefix:@"System"] || [className hasPrefix:@"Mono"]) continue;
+
+            // Check if CLASS matches keyword
+            BOOL classMatch = [className localizedCaseInsensitiveContainsString:keyword];
+            
+            void *iter = NULL;
+            void *method = NULL;
+            while ((method = il2cpp_class_get_methods(klass, &iter))) {
+                const char *mName = il2cpp_method_get_name(method);
+                if (!mName) continue;
+                NSString *methodName = [NSString stringWithUTF8String:mName];
+                
+                // SEARCH LOGIC
+                if (classMatch || [methodName localizedCaseInsensitiveContainsString:keyword]) {
+                    // Extract Pointer (Hack for Il2Cpp Method Struct)
+                    // The pointer is usually the first member of the struct in recent Unity
+                    uintptr_t ptr = *(uintptr_t*)method; 
+                    
+                    if (ptr > unityBase) {
+                        uintptr_t offset = ptr - unityBase;
+                        [log appendFormat:@"0x%lx : %@[%@]\n", offset, className, methodName];
+                        foundCount++;
+                    }
+                }
+            }
+        }
+        if (foundCount > 50) break; // Limit results
+    }
+    
+    if (foundCount == 0) return @"No matches found in UnityFramework.";
+    return log;
+}
+
+// --- 2. MEMORY PATCHER ---
 extern void sys_icache_invalidate(void *start, size_t len);
 
-// --- 1. MEMORY PATCHER ---
 NSData *dataFromHexString(NSString *string) {
     string = [string stringByReplacingOccurrencesOfString:@" " withString:@""];
     string = [string stringByReplacingOccurrencesOfString:@"0x" withString:@""];
@@ -27,7 +135,11 @@ NSData *dataFromHexString(NSString *string) {
 NSString *apply_patch(uint64_t offset, NSString *hexStr) {
     NSData *data = dataFromHexString(hexStr);
     if (!data || data.length == 0) return @"Invalid Hex";
-    uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
+    
+    // TARGET UNITY FRAMEWORK
+    uintptr_t base = get_image_base("UnityFramework");
+    if (base == 0) return @"Error: UnityFramework not found!";
+    
     uintptr_t addr = base + offset;
     vm_size_t size = data.length;
     vm_address_t page_start = addr & ~PAGE_MASK;
@@ -43,67 +155,12 @@ NSString *apply_patch(uint64_t offset, NSString *hexStr) {
     return @"Patched!";
 }
 
-// --- 2. OFFSET INSPECTOR (The Scraper) ---
-NSString *scan_methods(NSString *keyword) {
-    NSMutableString *results = [NSMutableString stringWithFormat:@"--- Scanning for '%@' ---\n", keyword];
-    int count = 0;
-    uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
-
-    int numClasses = objc_getClassList(NULL, 0);
-    Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
-    numClasses = objc_getClassList(classes, numClasses);
-
-    for (int i = 0; i < numClasses; i++) {
-        Class cls = classes[i];
-        const char *cName = class_getName(cls);
-        NSString *className = [NSString stringWithUTF8String:cName];
-
-        if ([className hasPrefix:@"UI"] || [className hasPrefix:@"NS"] || [className hasPrefix:@"_"]) continue;
-
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(cls, &methodCount);
-
-        for (unsigned int j = 0; j < methodCount; j++) {
-            Method m = methods[j];
-            SEL sel = method_getName(m);
-            NSString *selectorName = [NSString stringWithUTF8String:sel_getName(sel)];
-
-            if (([className localizedCaseInsensitiveContainsString:keyword] || 
-                 [selectorName localizedCaseInsensitiveContainsString:keyword])) {
-                
-                uintptr_t imp = (uintptr_t)method_getImplementation(m);
-                if (imp > base) {
-                    uintptr_t offset = imp - base;
-                    [results appendFormat:@"0x%lx : [%@ %@]\n", offset, className, selectorName];
-                    count++;
-                }
-            }
-        }
-        free(methods);
-        if (count > 50) {
-            [results appendString:@"... (Too many results)\n"];
-            break; 
-        }
-    }
-    free(classes);
-    if (count == 0) return @"No matches found.";
-    return results;
-}
-
-// --- 3. UI SYSTEM (FIXED HIT TEST) ---
-
+// --- 3. UI SYSTEM ---
 @interface PassThroughWindow : UIWindow @end
 @implementation PassThroughWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
-    
-    // THE FIX: If the hit view is the Window itself or the Root View Controller's background,
-    // return nil so the touch passes through to the game.
-    if (hitView == self || hitView == self.rootViewController.view) {
-        return nil;
-    }
-    
-    // Otherwise (if it's a Button, TextField, or Alert), return the view.
+    if (hitView == self || hitView == self.rootViewController.view) return nil;
     return hitView;
 }
 @end
@@ -140,13 +197,10 @@ NSString *scan_methods(NSString *keyword) {
     self.overlayWindow.windowLevel = UIWindowLevelAlert + 1;
     self.overlayWindow.backgroundColor = [UIColor clearColor];
     
-    // Create a generic VC for the window
     UIViewController *rootVC = [UIViewController new];
-    rootVC.view.backgroundColor = [UIColor clearColor]; // Ensure transparent
+    rootVC.view.backgroundColor = [UIColor clearColor];
     self.overlayWindow.rootViewController = rootVC;
     self.overlayWindow.hidden = NO;
-    
-    // Add button to the RootVC's view, NOT the window directly (Fixes rotation issues)
     [self createButton];
 }
 
@@ -159,10 +213,8 @@ NSString *scan_methods(NSString *keyword) {
     self.menuBtn.layer.borderColor = [UIColor greenColor].CGColor;
     self.menuBtn.layer.borderWidth = 2;
     [self.menuBtn addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
-    
     UIPanGestureRecognizer *p = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
     [self.menuBtn addGestureRecognizer:p];
-    
     [self.overlayWindow.rootViewController.view addSubview:self.menuBtn];
 }
 
@@ -174,13 +226,13 @@ NSString *scan_methods(NSString *keyword) {
 }
 
 - (void)showMenu {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Inspector" message:@"Choose Action" preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Unity Inspector" message:@"Select Action" preferredStyle:UIAlertControllerStyleActionSheet];
     
-    // ACTION 1: PATCHER
-    [ac addAction:[UIAlertAction actionWithTitle:@"Apply Hex Patch" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-        UIAlertController *p = [UIAlertController alertControllerWithTitle:@"Patcher" message:nil preferredStyle:UIAlertControllerStyleAlert];
-        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Offset (0x...)"; }];
-        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Hex (C003...)"; }];
+    // 1. PATCHER
+    [ac addAction:[UIAlertAction actionWithTitle:@"Patcher (Offsets)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *p = [UIAlertController alertControllerWithTitle:@"Unity Patcher" message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Offset (e.g. 0x123ABC)"; }];
+        [p addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Hex (e.g. C0035FD6)"; }];
         [p addAction:[UIAlertAction actionWithTitle:@"Apply" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
             NSString *res = apply_patch(strtoull([p.textFields[0].text UTF8String], NULL, 16), p.textFields[1].text);
             [self alertRes:res];
@@ -189,14 +241,14 @@ NSString *scan_methods(NSString *keyword) {
         [self.overlayWindow.rootViewController presentViewController:p animated:YES completion:nil];
     }]];
     
-    // ACTION 2: SCRAPER
-    [ac addAction:[UIAlertAction actionWithTitle:@"Search Offsets" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-        UIAlertController *s = [UIAlertController alertControllerWithTitle:@"Scraper" message:@"Enter keyword" preferredStyle:UIAlertControllerStyleAlert];
-        [s addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Keyword"; }];
+    // 2. UNITY SCANNER
+    [ac addAction:[UIAlertAction actionWithTitle:@"Scan Unity (Il2Cpp)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *s = [UIAlertController alertControllerWithTitle:@"Unity Scanner" message:@"Enter class/method name" preferredStyle:UIAlertControllerStyleAlert];
+        [s addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"e.g. Health, Coins, God"; }];
         [s addAction:[UIAlertAction actionWithTitle:@"Scan" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-            NSString *logs = scan_methods(s.textFields[0].text);
+            NSString *logs = scan_unity_methods(s.textFields[0].text);
             
-            UIAlertController *res = [UIAlertController alertControllerWithTitle:@"Results" message:nil preferredStyle:UIAlertControllerStyleAlert];
+            UIAlertController *res = [UIAlertController alertControllerWithTitle:@"Scan Results" message:nil preferredStyle:UIAlertControllerStyleAlert];
             [res addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
                 [UIPasteboard generalPasteboard].string = logs;
             }]];
@@ -206,6 +258,8 @@ NSString *scan_methods(NSString *keyword) {
             UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 0, 270, 300)];
             tv.text = logs;
             tv.editable = NO;
+            tv.backgroundColor = [UIColor whiteColor];
+            tv.textColor = [UIColor blackColor];
             tv.font = [UIFont fontWithName:@"Courier" size:10];
             vc.preferredContentSize = CGSizeMake(270, 300);
             [vc.view addSubview:tv];
@@ -229,7 +283,7 @@ NSString *scan_methods(NSString *keyword) {
 @end
 
 %ctor {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [[MenuManager shared] start];
     });
 }
