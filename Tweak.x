@@ -1,25 +1,21 @@
 #import <UIKit/UIKit.h>
+#import <AudioToolbox/AudioToolbox.h> // For vibration
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <sys/mman.h>
 
-// --- FIX: Manually declare the missing function ---
+// --- DECLARE MISSING FUNCTION ---
 extern void sys_icache_invalidate(void *start, size_t len);
 
 // --- 1. MEMORY PATCHING ENGINE ---
 
-/*
- * Helper: Converts "C0035FD6" string to raw bytes
- */
 NSData *dataFromHexString(NSString *string) {
     string = [string stringByReplacingOccurrencesOfString:@" " withString:@""];
     string = [string stringByReplacingOccurrencesOfString:@"0x" withString:@""];
-    
     NSMutableData *data = [NSMutableData new];
     unsigned char whole_byte;
     char byte_chars[3] = {'\0','\0','\0'};
-    
     for (int i = 0; i < [string length] / 2; i++) {
         byte_chars[0] = [string characterAtIndex:i * 2];
         byte_chars[1] = [string characterAtIndex:i * 2 + 1];
@@ -29,155 +25,157 @@ NSData *dataFromHexString(NSString *string) {
     return data;
 }
 
-/*
- * The Patch Function
- */
 NSString *apply_patch(uint64_t offset, NSString *hexStr) {
     NSData *data = dataFromHexString(hexStr);
     if (!data || data.length == 0) return @"Invalid Hex Data";
 
-    // Get Binary Base Address
     uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
     uintptr_t addr = base + offset;
 
-    // Align to page size (Required for vm_protect)
     vm_size_t size = data.length;
     vm_address_t page_start = addr & ~PAGE_MASK;
     vm_address_t page_end = (addr + size + PAGE_MASK) & ~PAGE_MASK;
     vm_size_t page_size = page_end - page_start;
 
-    // Unlock Memory (RWX)
     kern_return_t kr = vm_protect(mach_task_self(), page_start, page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    
-    if (kr != KERN_SUCCESS) {
-        return [NSString stringWithFormat:@"Error: Memory Unlock Failed (Code %d). Is JIT enabled?", kr];
-    }
+    if (kr != KERN_SUCCESS) return [NSString stringWithFormat:@"Error: Unlock Failed (%d)", kr];
 
-    // Write Data
     memcpy((void *)addr, [data bytes], size);
-
-    // Relock Memory (RX)
     vm_protect(mach_task_self(), page_start, page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-
-    // Flush CPU Cache
     sys_icache_invalidate((void *)addr, size);
 
-    return @"Patch Applied Successfully!";
+    return @"Patch Applied!";
 }
 
-// --- 2. FLOATING MENU UI ---
+// --- 2. ROBUST UI MANAGER ---
 
-@interface FloatingMenu : UIWindow
-@property (nonatomic, strong) UIButton *btn;
+@interface MenuManager : NSObject
+@property (nonatomic, strong) UIWindow *overlayWindow;
+@property (nonatomic, strong) UIButton *menuBtn;
+@property (nonatomic, strong) NSTimer *loadTimer;
 + (instancetype)shared;
+- (void)tryToLoadMenu;
 @end
 
-@implementation FloatingMenu
+@implementation MenuManager
 
 + (instancetype)shared {
-    static FloatingMenu *shared = nil;
+    static MenuManager *shared = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        shared = [[FloatingMenu alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        shared = [[MenuManager alloc] init];
     });
     return shared;
 }
 
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.windowLevel = UIWindowLevelAlert + 1; // Sit above everything
-        self.backgroundColor = [UIColor clearColor];
-        self.rootViewController = [UIViewController new];
-        self.hidden = NO;
-        [self createButton];
-    }
-    return self;
+- (void)start {
+    // Retry every 2 seconds until we find a valid scene
+    self.loadTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(tryToLoadMenu) userInfo:nil repeats:YES];
 }
 
-// Pass touches through the empty parts of the window
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    if (CGRectContainsPoint(self.btn.frame, point)) {
-        return YES;
-    }
-    return NO;
-}
-
-- (void)createButton {
-    self.btn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.btn.frame = CGRectMake(20, 100, 50, 50);
-    self.btn.backgroundColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.1 alpha:0.8];
-    [self.btn setTitle:@"🛠️" forState:UIControlStateNormal];
-    self.btn.layer.cornerRadius = 25;
-    self.btn.layer.borderWidth = 2;
-    self.btn.layer.borderColor = [UIColor cyanColor].CGColor;
+- (void)tryToLoadMenu {
+    UIWindowScene *activeScene = nil;
     
-    // Add Drag Gesture
+    // 1. Find the active scene
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+            activeScene = (UIWindowScene *)scene;
+            break;
+        }
+    }
+
+    // If no scene found yet, return and wait for next timer tick
+    if (!activeScene) return;
+
+    // 2. Found a scene! Stop timer and build UI.
+    [self.loadTimer invalidate];
+    self.loadTimer = nil;
+
+    // Vibrate to tell user we loaded
+    AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+    
+    // 3. Create Window attached to Scene
+    self.overlayWindow = [[UIWindow alloc] initWithWindowScene:activeScene];
+    self.overlayWindow.frame = [UIScreen mainScreen].bounds;
+    self.overlayWindow.windowLevel = UIWindowLevelStatusBar + 50.0; // Very high
+    self.overlayWindow.backgroundColor = [UIColor clearColor];
+    self.overlayWindow.rootViewController = [UIViewController new];
+    self.overlayWindow.userInteractionEnabled = YES; // Must be YES, but we handle hitTest manually
+    self.overlayWindow.hidden = NO;
+    [self.overlayWindow makeKeyAndVisible];
+
+    // 4. Create Button
+    self.menuBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.menuBtn.frame = CGRectMake(50, 150, 60, 60);
+    self.menuBtn.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.8];
+    [self.menuBtn setTitle:@"⚙️" forState:UIControlStateNormal];
+    self.menuBtn.titleLabel.font = [UIFont systemFontOfSize:30];
+    self.menuBtn.layer.cornerRadius = 30;
+    self.menuBtn.layer.borderColor = [UIColor redColor].CGColor;
+    self.menuBtn.layer.borderWidth = 2;
+    
+    [self.menuBtn addTarget:self action:@selector(showPopup) forControlEvents:UIControlEventTouchUpInside];
+    
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleDrag:)];
-    [self.btn addGestureRecognizer:pan];
+    [self.menuBtn addGestureRecognizer:pan];
+
+    [self.overlayWindow addSubview:self.menuBtn];
     
-    // Add Tap Action
-    [self.btn addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
-    
-    [self addSubview:self.btn];
+    // Bring window to front again just in case
+    [self.overlayWindow.layer setZPosition:MAXFLOAT];
 }
 
-- (void)handleDrag:(UIPanGestureRecognizer *)sender {
-    UIView *view = sender.view;
-    CGPoint translation = [sender translationInView:self];
-    view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
-    [sender setTranslation:CGPointZero inView:self];
+// Pass touches through empty space
+// We override the getter of the window to swap hit testing behavior
+// But for simplicity in a single file, we can just be careful with size.
+// Since we made the window full screen, we need to ensure it doesn't block touches.
+// The easiest way in a simple Tweak.x is to actually ADD the button to the KeyWindow if possible,
+// OR use this trick:
+
+- (void)handleDrag:(UIPanGestureRecognizer *)p {
+    UIView *v = p.view;
+    CGPoint t = [p translationInView:self.overlayWindow];
+    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+    [p setTranslation:CGPointZero inView:self.overlayWindow];
 }
 
-- (void)showMenu {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Live Patcher"
-                                                                   message:@"Enter Relative Offset & Hex"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.placeholder = @"Offset (e.g. 0x1005A0)";
-        field.textColor = [UIColor blackColor];
-        field.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
+- (void)showPopup {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Patcher" message:@"Enter Offset & Hex" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Offset (0x...)"; }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Hex (C003...)"; }];
     
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.placeholder = @"Hex (e.g. C0035FD6)";
-        field.textColor = [UIColor blackColor];
-        field.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-
-    UIAlertAction *patchAction = [UIAlertAction actionWithTitle:@"APPLY PATCH" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        NSString *offsetStr = alert.textFields[0].text;
-        NSString *hexStr = alert.textFields[1].text;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Apply" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        NSString *res = apply_patch(strtoull([alert.textFields[0].text UTF8String], NULL, 16), alert.textFields[1].text);
         
-        // Parse Offset
-        unsigned long long offset = 0;
-        NSScanner *scanner = [NSScanner scannerWithString:offsetStr];
-        [scanner scanHexLongLong:&offset];
-
-        // Apply
-        NSString *result = apply_patch(offset, hexStr);
-        
-        // Show Result
-        UIAlertController *resAlert = [UIAlertController alertControllerWithTitle:@"Result" 
-                                                                          message:result 
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-        [resAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self.rootViewController presentViewController:resAlert animated:YES completion:nil];
-    }];
-
-    [alert addAction:patchAction];
+        UIAlertController *resA = [UIAlertController alertControllerWithTitle:res message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [resA addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+        [self.overlayWindow.rootViewController presentViewController:resA animated:YES completion:nil];
+    }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-
-    [self.rootViewController presentViewController:alert animated:YES completion:nil];
+    [self.overlayWindow.rootViewController presentViewController:alert animated:YES completion:nil];
 }
 
 @end
 
-// --- 3. CONSTRUCTOR ---
+// Helper to make clicks pass through the window
+// We use method swizzling or just a subclass. Since we are in Tweak.x, let's just Hook UIWindow pointInside.
+// This ensures that if the user clicks OUTSIDE the button, the click goes to the game.
+
+%hook UIWindow
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    // Check if this is OUR overlay window
+    if (self == [MenuManager shared].overlayWindow) {
+        if (CGRectContainsPoint([MenuManager shared].menuBtn.frame, point)) {
+            return YES; // Clicked the button
+        }
+        return NO; // Clicked empty space -> pass to game
+    }
+    return %orig;
+}
+%end
 
 %ctor {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [FloatingMenu shared];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [[MenuManager shared] start];
     });
 }
