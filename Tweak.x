@@ -44,15 +44,11 @@ NSString *apply_patch(uint64_t offset, NSString *hexStr) {
 }
 
 // --- 2. OFFSET INSPECTOR (The Scraper) ---
-// This scans ObjC runtime for methods matching your query
 NSString *scan_methods(NSString *keyword) {
     NSMutableString *results = [NSMutableString stringWithFormat:@"--- Scanning for '%@' ---\n", keyword];
     int count = 0;
-    
-    // Get Base Address to calculate offsets
     uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
 
-    // Get all classes
     int numClasses = objc_getClassList(NULL, 0);
     Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
     numClasses = objc_getClassList(classes, numClasses);
@@ -62,7 +58,6 @@ NSString *scan_methods(NSString *keyword) {
         const char *cName = class_getName(cls);
         NSString *className = [NSString stringWithUTF8String:cName];
 
-        // Filter: Skip system classes to speed up (optional)
         if ([className hasPrefix:@"UI"] || [className hasPrefix:@"NS"] || [className hasPrefix:@"_"]) continue;
 
         unsigned int methodCount = 0;
@@ -71,16 +66,12 @@ NSString *scan_methods(NSString *keyword) {
         for (unsigned int j = 0; j < methodCount; j++) {
             Method m = methods[j];
             SEL sel = method_getName(m);
-            const char *selName = sel_getName(sel);
-            NSString *selectorName = [NSString stringWithUTF8String:selName];
+            NSString *selectorName = [NSString stringWithUTF8String:sel_getName(sel)];
 
-            // SEARCH LOGIC: Check if Class or Method contains keyword
             if (([className localizedCaseInsensitiveContainsString:keyword] || 
                  [selectorName localizedCaseInsensitiveContainsString:keyword])) {
                 
                 uintptr_t imp = (uintptr_t)method_getImplementation(m);
-                // Calculate Offset: IMP - Base
-                // Note: Only works if IMP is inside the main binary.
                 if (imp > base) {
                     uintptr_t offset = imp - base;
                     [results appendFormat:@"0x%lx : [%@ %@]\n", offset, className, selectorName];
@@ -89,24 +80,30 @@ NSString *scan_methods(NSString *keyword) {
             }
         }
         free(methods);
-        if (count > 50) { // Limit results to prevent lag
-            [results appendString:@"... (Too many results, refine search)\n"];
+        if (count > 50) {
+            [results appendString:@"... (Too many results)\n"];
             break; 
         }
     }
     free(classes);
-    
     if (count == 0) return @"No matches found.";
     return results;
 }
 
-// --- 3. UI SYSTEM ---
+// --- 3. UI SYSTEM (FIXED HIT TEST) ---
 
 @interface PassThroughWindow : UIWindow @end
 @implementation PassThroughWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
-    if (hitView == self) return nil;
+    
+    // THE FIX: If the hit view is the Window itself or the Root View Controller's background,
+    // return nil so the touch passes through to the game.
+    if (hitView == self || hitView == self.rootViewController.view) {
+        return nil;
+    }
+    
+    // Otherwise (if it's a Button, TextField, or Alert), return the view.
     return hitView;
 }
 @end
@@ -142,9 +139,18 @@ NSString *scan_methods(NSString *keyword) {
     self.overlayWindow.frame = [UIScreen mainScreen].bounds;
     self.overlayWindow.windowLevel = UIWindowLevelAlert + 1;
     self.overlayWindow.backgroundColor = [UIColor clearColor];
-    self.overlayWindow.rootViewController = [UIViewController new];
+    
+    // Create a generic VC for the window
+    UIViewController *rootVC = [UIViewController new];
+    rootVC.view.backgroundColor = [UIColor clearColor]; // Ensure transparent
+    self.overlayWindow.rootViewController = rootVC;
     self.overlayWindow.hidden = NO;
     
+    // Add button to the RootVC's view, NOT the window directly (Fixes rotation issues)
+    [self createButton];
+}
+
+- (void)createButton {
     self.menuBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.menuBtn.frame = CGRectMake(20, 100, 50, 50);
     self.menuBtn.backgroundColor = [UIColor blackColor];
@@ -156,7 +162,8 @@ NSString *scan_methods(NSString *keyword) {
     
     UIPanGestureRecognizer *p = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
     [self.menuBtn addGestureRecognizer:p];
-    [self.overlayWindow addSubview:self.menuBtn];
+    
+    [self.overlayWindow.rootViewController.view addSubview:self.menuBtn];
 }
 
 - (void)drag:(UIPanGestureRecognizer *)p {
@@ -182,21 +189,19 @@ NSString *scan_methods(NSString *keyword) {
         [self.overlayWindow.rootViewController presentViewController:p animated:YES completion:nil];
     }]];
     
-    // ACTION 2: SCRAPER (OFFSET FINDER)
-    [ac addAction:[UIAlertAction actionWithTitle:@"Search Offsets (Scrape)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-        UIAlertController *s = [UIAlertController alertControllerWithTitle:@"Offset Scraper" message:@"Enter keyword (e.g. Health, Coin)" preferredStyle:UIAlertControllerStyleAlert];
+    // ACTION 2: SCRAPER
+    [ac addAction:[UIAlertAction actionWithTitle:@"Search Offsets" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *s = [UIAlertController alertControllerWithTitle:@"Scraper" message:@"Enter keyword" preferredStyle:UIAlertControllerStyleAlert];
         [s addTextFieldWithConfigurationHandler:^(UITextField *t){ t.placeholder=@"Keyword"; }];
         [s addAction:[UIAlertAction actionWithTitle:@"Scan" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
             NSString *logs = scan_methods(s.textFields[0].text);
             
-            // Show results in a text view alert
             UIAlertController *res = [UIAlertController alertControllerWithTitle:@"Results" message:nil preferredStyle:UIAlertControllerStyleAlert];
-            [res addAction:[UIAlertAction actionWithTitle:@"Copy to Clipboard" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [res addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
                 [UIPasteboard generalPasteboard].string = logs;
             }]];
             [res addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
             
-            // Hacky Text View in Alert
             UIViewController *vc = [[UIViewController alloc] init];
             UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 0, 270, 300)];
             tv.text = logs;
