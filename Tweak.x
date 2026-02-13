@@ -1,238 +1,170 @@
 #import <UIKit/UIKit.h>
-#import <AudioToolbox/AudioToolbox.h>
-#import <substrate.h>
-#import <math.h>
+#import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
 
-// ==========================================
-// PART 1: AUDIO PROCESSING (THE ROBOT EFFECT)
-// ==========================================
+// --- MEMORY PATCHING ENGINE ---
 
-// Global Settings
-static BOOL gEnabled = YES;       // Default to ON so you hear it immediately
-static float gRobotFreq = 400.0;  // 400Hz = Deep Robot Voice
-
-// Pointer to the original system function
-OSStatus (*orig_AudioUnitRender)(AudioUnit unit, 
-                                 AudioUnitRenderActionFlags *ioActionFlags, 
-                                 const AudioTimeStamp *inTimeStamp, 
-                                 UInt32 inBusNumber, 
-                                 UInt32 inNumberFrames, 
-                                 AudioBufferList *ioData);
-
-// OUR INTERCEPTOR FUNCTION
-OSStatus hook_AudioUnitRender(AudioUnit unit, 
-                              AudioUnitRenderActionFlags *ioActionFlags, 
-                              const AudioTimeStamp *inTimeStamp, 
-                              UInt32 inBusNumber, 
-                              UInt32 inNumberFrames, 
-                              AudioBufferList *ioData) {
-    
-    // 1. Let the system capture the real microphone audio first
-    OSStatus status = orig_AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
-    
-    // 2. If it failed, or we are disabled, just return
-    if (status != noErr || !gEnabled) return status;
-    
-    // 3. APPLY THE EFFECT (Ring Modulation)
-    // We multiply the audio by a Sine Wave. This creates a "Dalek" robot effect.
-    // It works even if Discord tries to cancel noise.
-    
-    static double phase = 0.0;
-    double phaseIncrement = 2.0 * 3.14159 * gRobotFreq / 48000.0; // Assume 48kHz
-    
-    // Loop through all audio buffers (Left/Right channels)
-    for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
-        AudioBuffer buffer = ioData->mBuffers[i];
-        if (!buffer.mData) continue;
-        
-        SInt16 *samples = (SInt16 *)buffer.mData; // Raw Audio Samples
-        UInt32 count = inNumberFrames;
-        
-        for (UInt32 j = 0; j < count; j++) {
-            // Read sample
-            float raw = (float)samples[j];
-            
-            // Generate Sine Wave
-            float modulator = sin(phase);
-            
-            // MATH: Multiply them together
-            samples[j] = (SInt16)(raw * modulator);
-            
-            // Advance the sine wave
-            phase += phaseIncrement;
-            if (phase > 6.28318) phase -= 6.28318;
-        }
+/*
+ * Converts "C0035FD6" (String) -> <C0 03 5F D6> (NSData)
+ */
+NSData *dataFromHexString(NSString *string) {
+    string = [string stringByReplacingOccurrencesOfString:@" " withString:@""];
+    string = [string stringByReplacingOccurrencesOfString:@"0x" withString:@""];
+    NSMutableData *data = [NSMutableData new];
+    unsigned char whole_byte;
+    char byte_chars[3] = {'\0','\0','\0'};
+    for (int i = 0; i < [string length] / 2; i++) {
+        byte_chars[0] = [string characterAtIndex:i * 2];
+        byte_chars[1] = [string characterAtIndex:i * 2 + 1];
+        whole_byte = strtol(byte_chars, NULL, 16);
+        [data appendBytes:&whole_byte length:1];
     }
-    
-    return status;
+    return data;
 }
 
-// ==========================================
-// PART 2: THE MENU UI
-// ==========================================
+/*
+ * The Patch Function
+ * Tries to make memory Writable (RWX) to apply the patch.
+ */
+NSString *apply_patch(uint64_t offset, NSString *hexStr) {
+    NSData *data = dataFromHexString(hexStr);
+    if (!data || data.length == 0) return @"Invalid Hex Data";
 
-static BOOL isMenuOpen = NO;
-static UIButton *activeButton = nil;
+    // 1. Get location
+    uintptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
+    uintptr_t addr = base + offset;
 
-// Helper to make buttons look nice
-void setButtonState(UIButton *btn, BOOL isOn) {
-    UIButtonConfiguration *config = btn.configuration;
-    if (isOn) {
-        config.baseBackgroundColor = [UIColor systemGreenColor];
-        config.image = [UIImage systemImageNamed:@"waveform.path.ecg"];
-    } else {
-        config.baseBackgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
-        config.image = nil;
+    // 2. Align to page size (required for vm_protect)
+    vm_size_t size = data.length;
+    vm_address_t page_start = addr & ~PAGE_MASK;
+    vm_address_t page_end = (addr + size + PAGE_MASK) & ~PAGE_MASK;
+    vm_size_t page_size = page_end - page_start;
+
+    // 3. Unlock Memory
+    // NOTE: In jailed mode without JIT, this is the step that usually fails.
+    kern_return_t kr = vm_protect(mach_task_self(), page_start, page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    
+    if (kr != KERN_SUCCESS) {
+        return [NSString stringWithFormat:@"Failed to unlock memory (Error: %d). JIT might be required.", kr];
     }
-    btn.configuration = config;
+
+    // 4. Write Data
+    memcpy((void *)addr, [data bytes], size);
+
+    // 5. Relock Memory (Execute)
+    vm_protect(mach_task_self(), page_start, page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    return @"Success!";
 }
 
-void showEnigmaMenu() {
-    if (isMenuOpen) return;
-    
-    // Modern Window Finder (iOS 15 - iOS 26 Compatible)
-    UIWindow *targetWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                if (w.isKeyWindow) {
-                    targetWindow = w;
-                    break;
-                }
-            }
-        }
-        if (targetWindow) break;
-    }
-    if (!targetWindow) return; // Safety check
+// --- FLOATING MENU UI ---
 
-    isMenuOpen = YES;
+@interface FloatingMenu : UIWindow
+@property (nonatomic, strong) UIButton *btn;
+@end
 
-    // 1. Blur Background
-    UIVisualEffectView *overlay = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
-    overlay.frame = targetWindow.bounds;
-    overlay.alpha = 0;
-    [targetWindow addSubview:overlay];
-    
-    // 2. Menu Card
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 380)];
-    card.center = targetWindow.center;
-    card.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
-    card.layer.cornerRadius = 24;
-    card.layer.borderColor = [UIColor whiteColor].CGColor;
-    card.layer.borderWidth = 1;
-    [overlay.contentView addSubview:card];
-    
-    // 3. Header
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 25, 320, 30)];
-    lbl.text = @"ENIGMA: DISCORD MODE";
-    lbl.textColor = [UIColor whiteColor];
-    lbl.textAlignment = NSTextAlignmentCenter;
-    lbl.font = [UIFont systemFontOfSize:20 weight:UIFontWeightHeavy];
-    [card addSubview:lbl];
+@implementation FloatingMenu
 
-    // 4. Button Stack
-    UIStackView *stack = [[UIStackView alloc] initWithFrame:CGRectMake(30, 80, 260, 260)];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 15;
-    stack.distribution = UIStackViewDistributionFillEqually;
-    [card addSubview:stack];
-
-    // Helper Block to add buttons
-    void (^addBtn)(NSString*, NSString*, float) = ^(NSString* name, NSString* icon, float freq) {
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        UIButtonConfiguration *conf = [UIButtonConfiguration filledButtonConfiguration];
-        conf.title = [NSString stringWithFormat:@"%@  %@", icon, name];
-        btn.configuration = conf;
-        
-        // Initial State
-        setButtonState(btn, (gEnabled && gRobotFreq == freq));
-        
-        [btn addAction:[UIAction actionWithHandler:^(UIAction *action){
-            if (freq == 0) {
-                gEnabled = NO; // Turn Off
-            } else {
-                gEnabled = YES;
-                gRobotFreq = freq;
-            }
-            
-            // Visual Update
-            if (activeButton) setButtonState(activeButton, NO);
-            setButtonState(btn, YES);
-            activeButton = btn;
-            
-        }] forControlEvents:UIControlEventTouchUpInside];
-        
-        [stack addArrangedSubview:btn];
-    };
-
-    // Add the Options
-    addBtn(@"Normal Voice", @"👤", 0.0);
-    addBtn(@"Deep Robot", @"🤖", 400.0);
-    addBtn(@"High Alien", @"👽", 800.0);
-    addBtn(@"Glitch Mode", @"👾", 1200.0);
-
-    // 5. Close Logic
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:overlay action:@selector(removeFromSuperview)];
-    [overlay addGestureRecognizer:tap];
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ isMenuOpen = NO; });
-
-    [UIView animateWithDuration:0.3 animations:^{ overlay.alpha = 1; }];
-}
-
-// ==========================================
-// PART 3: INJECTION HOOKS
-// ==========================================
-
-%hook UIWindow
-
-- (void)layoutSubviews {
-    %orig;
-    
-    // Only inject into the main window
-    if (!self.isKeyWindow) return;
-    
-    // Prevent duplicates
-    if ([self viewWithTag:9999]) return;
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if ([self viewWithTag:9999]) return;
-        
-        // Create the Floating "Alien" Button
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.frame = CGRectMake(self.frame.size.width - 70, 160, 50, 50);
-        btn.tag = 9999;
-        btn.backgroundColor = [UIColor systemIndigoColor];
-        btn.layer.cornerRadius = 25;
-        btn.layer.borderWidth = 2;
-        btn.layer.borderColor = [UIColor whiteColor].CGColor;
-        
-        [btn setTitle:@"👽" forState:UIControlStateNormal];
-        
-        // Open Menu on Tap
-        [btn addAction:[UIAction actionWithHandler:^(UIAction *action){
-            isMenuOpen = NO;
-            showEnigmaMenu();
-        }] forControlEvents:UIControlEventTouchUpInside];
-        
-        [self addSubview:btn];
-        [self bringSubviewToFront:btn];
++ (instancetype)shared {
+    static FloatingMenu *shared = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        shared = [[FloatingMenu alloc] initWithFrame:[UIScreen mainScreen].bounds];
     });
+    return shared;
 }
 
-%end
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.windowLevel = UIWindowLevelAlert + 1; // Above everything
+        self.backgroundColor = [UIColor clearColor];
+        self.rootViewController = [UIViewController new];
+        self.hidden = NO;
+        [self createButton];
+    }
+    return self;
+}
 
-// ==========================================
-// PART 4: CONSTRUCTOR (LOADER)
-// ==========================================
+// Ensure touches pass through empty space to the game
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (CGRectContainsPoint(self.btn.frame, point)) return YES;
+    return NO;
+}
 
-%ctor {
-    NSLog(@"[Enigma] Loading System Audio Hook...");
+- (void)createButton {
+    self.btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.btn.frame = CGRectMake(20, 100, 50, 50);
+    self.btn.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.7];
+    [self.btn setTitle:@"M" forState:UIControlStateNormal];
+    self.btn.layer.cornerRadius = 25;
+    self.btn.layer.borderWidth = 1;
+    self.btn.layer.borderColor = [UIColor redColor].CGColor;
     
-    // Hook the Low-Level AudioUnitRender function
-    MSHookFunction(
-        (void *)AudioUnitRender,
-        (void *)hook_AudioUnitRender,
-        (void **)&orig_AudioUnitRender
-    );
+    // Add Drag Support
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleDrag:)];
+    [self.btn addGestureRecognizer:pan];
+    
+    // Add Tap Support
+    [self.btn addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
+    
+    [self addSubview:self.btn];
+}
+
+- (void)handleDrag:(UIPanGestureRecognizer *)sender {
+    UIView *view = sender.view;
+    CGPoint translation = [sender translationInView:self];
+    view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
+    [sender setTranslation:CGPointZero inView:self];
+}
+
+- (void)showMenu {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Live Patcher"
+                                                                   message:@"Enter Offset & Hex"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"Offset (e.g. 0x123456)";
+        field.textColor = [UIColor blackColor]; 
+    }];
+    
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"Hex (e.g. C0035FD6)";
+        field.textColor = [UIColor blackColor];
+    }];
+
+    UIAlertAction *patch = [UIAlertAction actionWithTitle:@"PATCH" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        NSString *offsetStr = alert.textFields[0].text;
+        NSString *hexStr = alert.textFields[1].text;
+        
+        // Parse Offset String to Long Long
+        unsigned long long offset = 0;
+        NSScanner *scanner = [NSScanner scannerWithString:offsetStr];
+        [scanner scanHexLongLong:&offset];
+
+        // Run Patch
+        NSString *result = apply_patch(offset, hexStr);
+        
+        // Show Result
+        UIAlertController *resAlert = [UIAlertController alertControllerWithTitle:@"Result" message:result preferredStyle:UIAlertControllerStyleAlert];
+        [resAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self.rootViewController presentViewController:resAlert animated:YES completion:nil];
+    }];
+
+    [alert addAction:patch];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    [self.rootViewController presentViewController:alert animated:YES completion:nil];
+}
+
+@end
+
+// --- CONSTRUCTOR ---
+%ctor {
+    // Delay load to ensure UIWindow is ready
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [FloatingMenu shared];
+    });
 }
