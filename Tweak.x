@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 #import <sys/mman.h>
 
-// --- FIX FOR COMPILER ERRORS ---
+// --- KERNEL & MEMORY API DEFINITIONS ---
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -15,30 +15,8 @@ extern "C" {
 }
 #endif
 
-// --- IL2CPP API ---
-typedef void* (*il2cpp_domain_get_t)(void);
-typedef void** (*il2cpp_domain_get_assemblies_t)(void* domain, size_t* size);
-typedef void* (*il2cpp_assembly_get_image_t)(void* assembly);
-typedef size_t (*il2cpp_image_get_class_count_t)(void* image);
-typedef void* (*il2cpp_image_get_class_t)(void* image, size_t index);
-typedef const char* (*il2cpp_class_get_name_t)(void* klass);
-typedef void* (*il2cpp_class_get_methods_t)(void* klass, void** iter);
-typedef const char* (*il2cpp_method_get_name_t)(void* method);
-
-// --- UI & ORIENTATION ---
-@interface LandscapeController : UIViewController @end
-@implementation LandscapeController
-- (BOOL)shouldAutorotate { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
-@end
-
-@interface PassThroughWindow : UIWindow @end
-@implementation PassThroughWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    return (hit == self || hit == self.rootViewController.view) ? nil : hit;
-}
-@end
+// --- STATE MANAGEMENT ---
+static BOOL isAutoPlayEnabled = NO;
 
 // --- MEMORY ENGINE ---
 uintptr_t get_active_base() {
@@ -47,7 +25,8 @@ uintptr_t get_active_base() {
         const char *name = _dyld_get_image_name(i);
         NSString *nsName = [NSString stringWithUTF8String:name];
         NSString *fileName = [nsName lastPathComponent];
-        if ([fileName containsString:@"UnityFramework"] || [fileName isEqualToString:@"cod"]) {
+        // Target the 8-Ball Pool specific binary or engine framework
+        if ([fileName containsString:@"UnityFramework"] || [fileName containsString:@"8Ball"]) {
             return (uintptr_t)_dyld_get_image_header(i);
         }
     }
@@ -60,7 +39,6 @@ kern_return_t safe_write(uintptr_t address, void *data, size_t size) {
     vm_address_t page_end = (address + size + PAGE_MASK) & ~PAGE_MASK;
     vm_size_t page_size = page_end - page_start;
 
-    // Error 2 happens here if get-task-allow is missing
     kern_return_t kr = mach_vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) return kr;
 
@@ -84,6 +62,21 @@ NSData *hexToBytes(NSString *str) {
     }
     return data;
 }
+
+// --- UI & ORIENTATION ---
+@interface LandscapeController : UIViewController @end
+@implementation LandscapeController
+- (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+@end
+
+@interface PassThroughWindow : UIWindow @end
+@implementation PassThroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self || hit == self.rootViewController.view) ? nil : hit;
+}
+@end
 
 // --- MOD MENU ---
 @interface ModMenu : NSObject
@@ -113,26 +106,30 @@ NSData *hexToBytes(NSString *str) {
 
     self.btn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.btn.frame = CGRectMake(100, 100, 55, 55);
-    self.btn.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.8];
-    [self.btn setTitle:@"🎭" forState:UIControlStateNormal];
+    self.btn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
+    [self.btn setTitle:@"🎱" forState:UIControlStateNormal];
     self.btn.layer.cornerRadius = 27.5;
     [self.btn addTarget:self action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
     [self.window.rootViewController.view addSubview:self.btn];
 }
 
 - (void)openMenu {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"COD MOD" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"POOL AUTOPLAY" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     
-    // Patch Method from your Tutorial
-    [ac addAction:[UIAlertAction actionWithTitle:@"💉 Apply Aim Flick (Tutorial)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        // Offset for get_AimAssistAmount from your analysis
-        uint64_t off = 0x5AE27C0; 
-        // Hex for FMOV S0, #31; RET
-        NSData *hex = hexToBytes(@"00F0271EC0035FD6");
-        kern_return_t kr = safe_write(get_active_base() + off, (void *)[hex bytes], [hex length]);
+    NSString *toggleText = isAutoPlayEnabled ? @"🔴 Disable Auto-Play" : @"🟢 Enable Auto-Play";
+    
+    [ac addAction:[UIAlertAction actionWithTitle:toggleText style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        isAutoPlayEnabled = !isAutoPlayEnabled;
         
-        NSString *res = (kr == KERN_SUCCESS) ? @"✅ Flick Applied!" : @"❌ Error 2: Needs JIT/Entitlement";
-        UIAlertController *r = [UIAlertController alertControllerWithTitle:@"Result" message:res preferredStyle:UIAlertControllerStyleAlert];
+        // Example: If enabling auto-play also requires forcing long lines via memory patch
+        if (isAutoPlayEnabled) {
+            uint64_t longLinesOffset = 0x2A3B4C0; // Mock offset for 8-Ball pool lines
+            NSData *hex = hexToBytes(@"200080D2C0035FD6"); // MOV X0, #1; RET
+            safe_write(get_active_base() + longLinesOffset, (void *)[hex bytes], [hex length]);
+        }
+        
+        NSString *res = isAutoPlayEnabled ? @"✅ Auto-Play Active!" : @"⏸ Auto-Play Paused";
+        UIAlertController *r = [UIAlertController alertControllerWithTitle:@"Status" message:res preferredStyle:UIAlertControllerStyleAlert];
         [r addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
         [self.window.rootViewController presentViewController:r animated:YES completion:nil];
     }]];
@@ -142,6 +139,34 @@ NSData *hexToBytes(NSString *str) {
 }
 @end
 
+// --- 8-BALL POOL AUTO-PLAY HOOK ---
+%hook GameController
+
+- (void)onFrameUpdate:(id)frameData {
+    %orig;
+
+    if (isAutoPlayEnabled) {
+        // Validation: Check if the "Green Hole" indicator is active for the current target
+        BOOL isGreenHoleTargeted = [self performSelector:NSSelectorFromString(@"isTargetPocketConfirmed")]; 
+
+        if (isGreenHoleTargeted) {
+            static dispatch_once_t executionToken;
+            dispatch_once(&executionToken, ^{
+                
+                // Actuator: Simulate the shot with calculated power
+                [self performSelector:@selector(executeShotWithPower:) withObject:@(0.85)]; 
+                
+                // Reset token after the turn is complete
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                    executionToken = 0; 
+                });
+            });
+        }
+    }
+}
+%end
+
+// --- INITIALIZATION ---
 %ctor {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [[ModMenu shared] setup];
