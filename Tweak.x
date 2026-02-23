@@ -15,6 +15,13 @@ extern "C" {
 }
 #endif
 
+// --- ARCHIVAL GAME INTERFACES (THE COMPILER FIX) ---
+// This tells the compiler exactly what methods exist on the target class.
+@interface GameController : NSObject
+- (BOOL)isTargetPocketConfirmed;
+- (void)executeShotWithPower:(NSNumber *)power;
+@end
+
 // --- STATE MANAGEMENT ---
 static BOOL isAutoPlayEnabled = NO;
 
@@ -25,7 +32,6 @@ uintptr_t get_active_base() {
         const char *name = _dyld_get_image_name(i);
         NSString *nsName = [NSString stringWithUTF8String:name];
         NSString *fileName = [nsName lastPathComponent];
-        // Target the 8-Ball Pool specific binary or engine framework
         if ([fileName containsString:@"UnityFramework"] || [fileName containsString:@"8Ball"]) {
             return (uintptr_t)_dyld_get_image_header(i);
         }
@@ -121,9 +127,9 @@ NSData *hexToBytes(NSString *str) {
     [ac addAction:[UIAlertAction actionWithTitle:toggleText style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
         isAutoPlayEnabled = !isAutoPlayEnabled;
         
-        // Example: If enabling auto-play also requires forcing long lines via memory patch
+        // Example Memory Patch
         if (isAutoPlayEnabled) {
-            uint64_t longLinesOffset = 0x2A3B4C0; // Mock offset for 8-Ball pool lines
+            uint64_t longLinesOffset = 0x2A3B4C0; // Mock offset
             NSData *hex = hexToBytes(@"200080D2C0035FD6"); // MOV X0, #1; RET
             safe_write(get_active_base() + longLinesOffset, (void *)[hex bytes], [hex length]);
         }
@@ -146,15 +152,15 @@ NSData *hexToBytes(NSString *str) {
     %orig;
 
     if (isAutoPlayEnabled) {
-        // Validation: Check if the "Green Hole" indicator is active for the current target
-        BOOL isGreenHoleTargeted = [self performSelector:NSSelectorFromString(@"isTargetPocketConfirmed")]; 
+        // Validation: Direct method call using the interface
+        BOOL isGreenHoleTargeted = [self isTargetPocketConfirmed]; 
 
         if (isGreenHoleTargeted) {
             static dispatch_once_t executionToken;
             dispatch_once(&executionToken, ^{
                 
-                // Actuator: Simulate the shot with calculated power
-                [self performSelector:@selector(executeShotWithPower:) withObject:@(0.85)]; 
+                // Actuator: Direct method call
+                [self executeShotWithPower:@(0.85)]; 
                 
                 // Reset token after the turn is complete
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
