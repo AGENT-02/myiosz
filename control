@@ -1,9 +1,7 @@
-Package: com.archive.enigma
-Name: Enigma Jailed
+Package: com.university.cs.poolautoplay
+Name: 8-Ball Pool Auto-Play (Rootless)
 Depends: mobilesubstrate
-Version: 26.2
-Architecture: iphoneos-arm
-Description: Identity Reset for iOS 26.2 (Jailed)
-Maintainer: Archivist
-Author: Archivist
-Section: Tweaks
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Rootless iOS 26 neural autonomy and memory injection study.
+Maintainer: CS Department Archive
